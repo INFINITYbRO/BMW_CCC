@@ -2,13 +2,18 @@
 Avito watcher — Telegram-бот, который следит за поисковыми выдачами Авито
 и присылает новые объявления.
 
-Команды:
-  /add <ссылка> [| название]   — добавить поиск (ссылка из браузера, с фильтрами)
+Как добавить поиск — просто пришли ссылку с Авито.
+Название можно написать с новой строки или через пробел после ссылки:
+  https://www.avito.ru/...
+  Vita Сочи
+
+Команды (N — номер из /list):
   /list                        — список поисков
-  /del <id>                    — удалить поиск
-  /price <id> <мин> <макс>     — фильтр по цене (0 = без ограничения)
-  /exclude <id> слово, слово   — не присылать объявления с этими словами
-  /stats <id>                  — медиана цен по поиску и рекомендуемый торг
+  /name N название             — переименовать поиск
+  /del N                       — удалить поиск
+  /price N мин макс            — фильтр по цене (0 = без ограничения)
+  /exclude N слово, слово      — не присылать объявления с этими словами
+  /stats N                     — медиана цен и рекомендуемый торг
   /check                       — проверить все поиски прямо сейчас
 """
 import asyncio
@@ -218,12 +223,41 @@ def allowed(msg: Message) -> bool:
     return not ALLOWED_IDS or msg.from_user.id in ALLOWED_IDS
 
 
-def owned_search(chat_id: int, sid: str):
-    if not sid.isdigit():
+def chat_search_ids(chat_id: int) -> list[int]:
+    return [r[0] for r in db.execute("SELECT id FROM searches WHERE chat_id=? ORDER BY id", (chat_id,))]
+
+
+def search_num(chat_id: int, sid: int) -> int:
+    """Номер поиска, который видит пользователь: 1, 2, 3… без дыр после удаления."""
+    ids = chat_search_ids(chat_id)
+    return ids.index(sid) + 1 if sid in ids else 0
+
+
+def owned_search(chat_id: int, num: str):
+    num = num.strip().lstrip("#")
+    if not num.isdigit():
         return None
-    return db.execute(
-        "SELECT * FROM searches WHERE id=? AND chat_id=?", (int(sid), chat_id)
-    ).fetchone()
+    ids = chat_search_ids(chat_id)
+    n = int(num)
+    if not 1 <= n <= len(ids):
+        return None
+    return db.execute("SELECT * FROM searches WHERE id=?", (ids[n - 1],)).fetchone()
+
+
+def default_title(url: str) -> str:
+    """Название по умолчанию — текст поиска из ссылки (q=ps+vita → «ps vita»)."""
+    q = dict(parse_qsl(urlsplit(url).query)).get("q", "").strip()
+    return q or "поиск"
+
+
+def split_link_and_title(text: str) -> tuple[str, str]:
+    """«ссылка | название», «ссылка название» или ссылка и название с новой строки."""
+    text = text.strip()
+    m = re.search(r"https?://\S*avito\.ru\S*", text)
+    if not m:
+        return "", ""
+    rest = (text[: m.start()] + " " + text[m.end():]).replace("|", " ")
+    return m.group(0), " ".join(rest.split())
 
 
 @dp.message(Command("start", "help"))
@@ -233,27 +267,51 @@ async def cmd_start(msg: Message):
     await msg.answer(html.escape(__doc__.strip()))
 
 
-@dp.message(Command("add"))
-async def cmd_add(msg: Message, command: CommandObject):
-    if not allowed(msg):
-        return
-    if not command.args:
-        return await msg.answer("Пришли так: /add https://www.avito.ru/... | Vita Сочи")
-    raw, _, title = command.args.partition("|")
+async def add_search(msg: Message, text: str):
+    raw, title = split_link_and_title(text)
+    if not raw:
+        return await msg.answer(
+            "Пришли ссылку с Авито, а с новой строки — название, например:\n"
+            "https://www.avito.ru/sochi/...?q=ps+vita\nVita Сочи"
+        )
     try:
         url = normalize_url(raw)
     except ValueError as e:
         return await msg.answer(str(e))
+    if db.execute("SELECT 1 FROM searches WHERE chat_id=? AND url=?", (msg.chat.id, url)).fetchone():
+        return await msg.answer("Этот поиск уже есть. /list")
+    title = title or default_title(url)
     cur = db.execute(
-        "INSERT INTO searches(chat_id, url, title) VALUES(?,?,?)",
-        (msg.chat.id, url, title.strip() or None),
+        "INSERT INTO searches(chat_id, url, title, exclude) VALUES(?,?,?,?)",
+        (msg.chat.id, url, title, DEFAULT_EXCLUDE),
     )
     db.commit()
+    n = search_num(msg.chat.id, cur.lastrowid)
     await msg.answer(
-        f"Добавил поиск #{cur.lastrowid}. Сейчас запомню текущие объявления, "
-        "присылать буду только новые."
+        f"Добавил поиск #{n} «{html.escape(title)}». Сейчас запомню текущие объявления, "
+        f"присылать буду только новые.\nПереименовать: /name {n} новое название"
     )
     asyncio.create_task(run_check())
+
+
+@dp.message(Command("add"))
+async def cmd_add(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    await add_search(msg, command.args or "")
+
+
+@dp.message(Command("name"))
+async def cmd_name(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    num, _, title = (command.args or "").strip().partition(" ")
+    row = owned_search(msg.chat.id, num)
+    if not row or not title.strip():
+        return await msg.answer("Формат: /name 1 Vita Сочи")
+    db.execute("UPDATE searches SET title=? WHERE id=?", (title.strip(), row[0]))
+    db.commit()
+    await msg.answer(f"Поиск #{num.lstrip('#')} теперь называется «{html.escape(title.strip())}».")
 
 
 @dp.message(Command("list"))
@@ -261,20 +319,20 @@ async def cmd_list(msg: Message):
     if not allowed(msg):
         return
     rows = db.execute(
-        "SELECT id, url, title, min_price, max_price, exclude FROM searches WHERE chat_id=?",
+        "SELECT id, url, title, min_price, max_price, exclude FROM searches WHERE chat_id=? ORDER BY id",
         (msg.chat.id,),
     ).fetchall()
     if not rows:
-        return await msg.answer("Поисков нет. Добавь: /add <ссылка>")
+        return await msg.answer("Поисков нет. Пришли ссылку с Авито, чтобы добавить.")
     lines = []
-    for sid, url, title, mn, mx, ex in rows:
+    for n, (sid, url, title, mn, mx, ex) in enumerate(rows, 1):
         name = html.escape(title or "поиск")
         flt = []
         if mn or mx:
             flt.append(f"цена {mn or 0}–{mx or '∞'}")
         if ex:
             flt.append(f"без: {html.escape(ex)}")
-        lines.append(f"#{sid} <a href=\"{html.escape(url)}\">{name}</a> {'· ' + '; '.join(flt) if flt else ''}")
+        lines.append(f"#{n} <a href=\"{html.escape(url)}\">{name}</a> {'· ' + '; '.join(flt) if flt else ''}")
     await msg.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -282,13 +340,14 @@ async def cmd_list(msg: Message):
 async def cmd_del(msg: Message, command: CommandObject):
     if not allowed(msg):
         return
-    row = owned_search(msg.chat.id, (command.args or "").strip())
+    num = (command.args or "").strip()
+    row = owned_search(msg.chat.id, num)
     if not row:
         return await msg.answer("Нет такого поиска. /list")
     db.execute("DELETE FROM searches WHERE id=?", (row[0],))
     db.execute("DELETE FROM items WHERE search_id=?", (row[0],))
     db.commit()
-    await msg.answer(f"Поиск #{row[0]} удалён.")
+    await msg.answer(f"Поиск «{html.escape(row[3] or 'поиск')}» удалён. Номера в /list обновились.")
 
 
 @dp.message(Command("price"))
@@ -297,7 +356,7 @@ async def cmd_price(msg: Message, command: CommandObject):
         return
     parts = (command.args or "").split()
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
-        return await msg.answer("Формат: /price <id> <мин> <макс>, например /price 1 5000 15000")
+        return await msg.answer("Формат: /price N мин макс, например /price 1 5000 15000")
     row = owned_search(msg.chat.id, parts[0])
     if not row:
         return await msg.answer("Нет такого поиска.")
@@ -313,7 +372,7 @@ async def cmd_exclude(msg: Message, command: CommandObject):
     sid, _, words = (command.args or "").partition(" ")
     row = owned_search(msg.chat.id, sid)
     if not row:
-        return await msg.answer("Формат: /exclude <id> чехол, картридж, игра")
+        return await msg.answer("Формат: /exclude 1 чехол, картридж, игра")
     clean = ", ".join(w.strip().lower() for w in words.split(",") if w.strip())
     db.execute("UPDATE searches SET exclude=? WHERE id=?", (clean, row[0]))
     db.commit()
@@ -326,7 +385,7 @@ async def cmd_stats(msg: Message, command: CommandObject):
         return
     row = owned_search(msg.chat.id, (command.args or "").strip())
     if not row:
-        return await msg.answer("Формат: /stats <id>")
+        return await msg.answer("Формат: /stats 1")
     prices = sorted(search_prices(row[0]))
     if len(prices) < 3:
         return await msg.answer("Пока мало данных.")
@@ -349,6 +408,15 @@ async def cmd_check(msg: Message):
     await msg.answer("Проверка завершена.")
 
 
+@dp.message()
+async def any_message(msg: Message):
+    if not allowed(msg) or not msg.text:
+        return
+    if "avito.ru" in msg.text:
+        return await add_search(msg, msg.text)
+    await msg.answer("Пришли ссылку с Авито (можно с названием) или /help")
+
+
 def passes_filters(item: Item, mn: int, mx: int, exclude: str) -> bool:
     if mn and item.price and item.price < mn:
         return False
@@ -366,7 +434,7 @@ async def notify(chat_id: int, search_id: int, search_title: str | None, item: I
         f"📍 {html.escape(item.place or '—')} · {html.escape(item.date or '')}\n"
         f"{price_comment(search_id, item.price)}\n"
         f"<a href=\"{html.escape(item.url)}\">Открыть на Авито</a>"
-        f"{' · #' + str(search_id) + ' ' + html.escape(search_title) if search_title else ''}"
+        f" · #{search_num(chat_id, search_id)} {html.escape(search_title or '')}"
     )
     try:
         if item.image:
@@ -428,8 +496,9 @@ async def run_check():
                     db.commit()
                     await bot.send_message(
                         chat_id,
-                        f"Поиск #{sid}: запомнил {len(items)} текущих объявлений. "
-                        f"Медиану и торг смотри в /stats {sid}",
+                        f"Поиск #{search_num(chat_id, sid)} «{html.escape(title or 'поиск')}»: "
+                        f"запомнил {len(items)} текущих объявлений. "
+                        f"Медиану и торг смотри в /stats {search_num(chat_id, sid)}",
                     )
                     continue
 
@@ -482,7 +551,7 @@ def seed_searches():
         if not exists:
             db.execute(
                 "INSERT INTO searches(chat_id, url, title, exclude) VALUES(?,?,?,?)",
-                (owner, url, title.strip() or None, DEFAULT_EXCLUDE),
+                (owner, url, title.strip() or default_title(url), DEFAULT_EXCLUDE),
             )
             log.info("Добавлен поиск из SEARCHES: %s", title.strip() or url)
     db.commit()
