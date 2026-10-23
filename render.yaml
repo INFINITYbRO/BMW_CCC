@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: avito-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_IDS
+        value: "535353056"
+      - key: CHECK_INTERVAL
+        value: "300"
+      - key: SEARCHES
+        value: "https://www.avito.ru/sochi/igry_pristavki_i_programmy/igry_pristavki_i_programmy/igrovye_pristavki_i_aksessuary/igrovye_pristavki-ASgBAgICAkSSAsoJ9M0UmsqPAw?cd=1&q=ps+vita | Vita Сочи"
+      - key: DEFAULT_EXCLUDE
+        value: "чехол, картридж, на запчасти, не включается, сломан"
+      - key: PROXY
+        sync: false

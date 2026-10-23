@@ -1,0 +1,6 @@
+aiogram>=3.13
+curl_cffi>=0.7
+beautifulsoup4>=4.12
+lxml>=5.0
+python-dotenv>=1.0
+aiohttp-socks>=0.9
