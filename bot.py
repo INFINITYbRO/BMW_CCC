@@ -46,7 +46,7 @@ load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))  # секунд между циклами
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # секунд между циклами
 PROXY = os.getenv("PROXY") or None  # http://user:pass@host:port — если Авито режет IP
 PROXY_FALLBACK = os.getenv("PROXY_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Прокси только для Telegram (если api.telegram.org недоступен): socks5://127.0.0.1:10808
@@ -238,7 +238,7 @@ FETCH_MODE = os.getenv("AVITO_FETCH_MODE", "reader").lower()
 if FETCH_MODE not in ("reader", "direct"):
     raise ValueError("AVITO_FETCH_MODE must be reader or direct")
 if FETCH_MODE == "reader":
-    CHECK_INTERVAL = max(CHECK_INTERVAL, 900)
+    CHECK_INTERVAL = max(CHECK_INTERVAL, 300)
 
 
 def parse_reader_items(markdown: str) -> list[Item]:
@@ -780,11 +780,15 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
 
 async def scheduler():
     while True:
+        started = time.monotonic()
+        log.info("Автопроверка: начало цикла, интервал %s с", CHECK_INTERVAL)
         try:
             await run_check()
         except Exception:
             log.exception("Сбой цикла проверки")
-        await asyncio.sleep(CHECK_INTERVAL + random.uniform(0, CHECK_INTERVAL * 0.3))
+        remaining = CHECK_INTERVAL - (time.monotonic() - started)
+        # Count from the previous start and avoid bursts after an overlong cycle.
+        await asyncio.sleep(remaining if remaining > 0 else CHECK_INTERVAL)
 
 
 async def wait_for_telegram():
