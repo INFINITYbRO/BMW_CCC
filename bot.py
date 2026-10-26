@@ -18,6 +18,7 @@ Avito watcher — Telegram-бот, который следит за поиско
 """
 import asyncio
 import html
+import json
 import logging
 import os
 import random
@@ -25,7 +26,7 @@ import re
 import sqlite3
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientSession, web
@@ -38,6 +39,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,6 +48,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))  # секунд между циклами
 PROXY = os.getenv("PROXY") or None  # http://user:pass@host:port — если Авито режет IP
+PROXY_FALLBACK = os.getenv("PROXY_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Прокси только для Telegram (если api.telegram.org недоступен): socks5://127.0.0.1:10808
 TG_PROXY = os.getenv("TG_PROXY") or None
 # Или своё зеркало Bot API (например, Cloudflare Worker): https://my-tg.workers.dev
@@ -78,6 +81,13 @@ db.executescript(
         seen_at INTEGER,
         PRIMARY KEY(search_id, item_id)
     );
+    CREATE TABLE IF NOT EXISTS pending_notifications(
+        search_id INTEGER,
+        item_id TEXT,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(search_id, item_id)
+    );
     """
 )
 db.commit()
@@ -105,12 +115,15 @@ class Item:
 def normalize_url(url: str) -> str:
     """Принудительно сортировка «по дате», чтобы новые были на первой странице."""
     parts = urlsplit(url.strip())
-    if "avito.ru" not in parts.netloc:
+    host = (parts.hostname or "").lower()
+    if (parts.scheme not in ("http", "https") or parts.username or parts.password
+            or parts.port not in (None, 80, 443)
+            or not (host == "avito.ru" or host.endswith(".avito.ru"))):
         raise ValueError("Это не ссылка на Авито")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["s"] = "104"  # сортировка: по дате
     query.pop("p", None)  # первая страница
-    return urlunsplit((parts.scheme or "https", parts.netloc, parts.path, urlencode(query), ""))
+    return urlunsplit(("https", host, parts.path, urlencode(query), ""))
 
 
 def _text(node) -> str:
@@ -120,7 +133,7 @@ def _text(node) -> str:
 def parse_items(page: str) -> list[Item]:
     soup = BeautifulSoup(page, "lxml")
     result = []
-    for card in soup.select('div[data-marker="item"]'):
+    for card in soup.select('[data-marker="item"]'):
         item_id = card.get("data-item-id") or card.get("id", "").lstrip("i")
         if not item_id:
             continue
@@ -152,19 +165,70 @@ def parse_items(page: str) -> list[Item]:
     return result
 
 
-class Blocked(Exception):
+class FetchError(Exception):
+    """Contains only a safe, user-facing diagnostic, never a raw request URL."""
+
+
+class Blocked(FetchError):
     pass
 
 
+proxy_retry_at = 0.0
+connection_note = ""
+
+
+def network_error(exc: RequestException, via_proxy: bool) -> str:
+    message = str(exc).lower()
+    if via_proxy and ("connect tunnel failed" in message or "proxy" in message
+                      or int(exc.code) in (5, 7, 28, 97)):
+        status = re.search(r"response\s+(\d{3})", message)
+        detail = f" (HTTP {status[1]})" if status else ""
+        return (
+            f"Прокси отклонил соединение или недоступен{detail}. "
+            "Проверь оплату, доступ по IP, адрес и пароль PROXY на Render."
+        )
+    return "Не удалось подключиться к Авито. Проверь сеть и настройку PROXY на Render."
+
+
 async def fetch(session: AsyncSession, url: str) -> list[Item]:
-    resp = await session.get(url, timeout=30, proxy=PROXY)
+    global proxy_retry_at, connection_note
+    via_proxy = bool(PROXY) and time.time() >= proxy_retry_at
+    options = {"proxy": PROXY} if via_proxy else {"proxies": {"all": ""}}
+    try:
+        resp = await session.get(url, timeout=30, **options)
+    except RequestException as exc:
+        reason = network_error(exc, via_proxy)
+        if not (via_proxy and PROXY_FALLBACK):
+            raise FetchError(reason) from None
+        # An unavailable proxy must not silently disable every search.
+        proxy_retry_at = time.time() + 300
+        connection_note = reason + " Пробую прямое соединение."
+        log.warning("%s", connection_note)
+        try:
+            via_proxy = False
+            resp = await session.get(url, timeout=30, proxies={"all": ""})
+        except RequestException:
+            raise FetchError(reason + " Прямое соединение тоже недоступно.") from None
     body = resp.text
-    if resp.status_code in (403, 429) or "Доступ ограничен" in body or "firewall" in body.lower():
-        raise Blocked(f"HTTP {resp.status_code}")
-    resp.raise_for_status()
+    lowered = body.lower()
+    if (resp.status_code in (401, 403, 407, 429)
+            or any(marker in lowered for marker in (
+                "доступ ограничен", "подтвердите, что вы не робот", "firewall",
+                "challenge-platform", "проверка браузера"))):
+        route = "через прокси" if via_proxy else "напрямую"
+        raise Blocked(
+            f"Авито ограничил доступ {route} (HTTP {resp.status_code}). "
+            "Нужен рабочий прокси с доступом к Авито."
+        )
+    if resp.status_code >= 400:
+        raise FetchError(f"Авито вернул HTTP {resp.status_code}. Проверь ссылку поиска.")
     items = parse_items(body)
-    if not items and 'data-marker="item"' not in body and "ничего не найдено" not in body.lower():
-        raise RuntimeError("Не нашёл карточек — возможно, Авито поменял вёрстку или показал капчу")
+    if not items and not any(text in lowered for text in (
+            "ничего не найдено", "ничего не нашлось", "нет объявлений",
+            'data-marker="search-results/empty"')):
+        raise FetchError(
+            "Не удалось прочитать объявления: изменилась страница Авито или показана капча."
+        )
     return items
 
 
@@ -191,21 +255,21 @@ def price_comment(search_id: int, price: int) -> str:
         return ""
     prices = search_prices(search_id)
     if len(prices) < 5:
-        return f"💬 Стартовое предложение: ~{rub(round_offer(price * (1 - OFFER_DISCOUNT)))}"
+        return f"<tg-emoji emoji-id='5870753782874246579'>✍</tg-emoji> Стартовое предложение: ~{rub(round_offer(price * (1 - OFFER_DISCOUNT)))}"
     med = statistics.median(prices)
     diff = (price - med) / med * 100
     # Если уже дёшево — торгуемся мягко, если дорого — целимся в медиану
     if diff <= -15:
-        verdict, target = "🔥 сильно ниже рынка, бери быстро", price * 0.95
+        verdict, target = "<tg-emoji emoji-id='5870930636742595124'>📊</tg-emoji> сильно ниже рынка, бери быстро", price * 0.95
     elif diff <= 0:
-        verdict, target = "✅ ниже медианы", price * (1 - OFFER_DISCOUNT / 2)
+        verdict, target = "<tg-emoji emoji-id='5870633910337015697'>✅</tg-emoji> ниже медианы", price * (1 - OFFER_DISCOUNT / 2)
     elif diff <= 20:
-        verdict, target = "➖ около рынка", min(price * (1 - OFFER_DISCOUNT), med)
+        verdict, target = "<tg-emoji emoji-id='6028435952299413210'>ℹ</tg-emoji> около рынка", min(price * (1 - OFFER_DISCOUNT), med)
     else:
-        verdict, target = "💸 дороже рынка", med * 0.95
+        verdict, target = "<tg-emoji emoji-id='5904462880941545555'>🪙</tg-emoji> дороже рынка", med * 0.95
     return (
-        f"📊 Медиана по поиску: {rub(med)} ({diff:+.0f}%) — {verdict}\n"
-        f"💬 Предложить: ~{rub(round_offer(target))}"
+        f"<tg-emoji emoji-id='5870921681735781843'>📊</tg-emoji> Медиана по поиску: {rub(med)} ({diff:+.0f}%) — {verdict}\n"
+        f"<tg-emoji emoji-id='5870753782874246579'>✍</tg-emoji> Предложить: ~{rub(round_offer(target))}"
     )
 
 
@@ -220,7 +284,7 @@ check_lock = asyncio.Lock()
 
 
 def allowed(msg: Message) -> bool:
-    return not ALLOWED_IDS or msg.from_user.id in ALLOWED_IDS
+    return not ALLOWED_IDS or bool(msg.from_user and msg.from_user.id in ALLOWED_IDS)
 
 
 def chat_search_ids(chat_id: int) -> list[int]:
@@ -346,6 +410,7 @@ async def cmd_del(msg: Message, command: CommandObject):
         return await msg.answer("Нет такого поиска. /list")
     db.execute("DELETE FROM searches WHERE id=?", (row[0],))
     db.execute("DELETE FROM items WHERE search_id=?", (row[0],))
+    db.execute("DELETE FROM pending_notifications WHERE search_id=?", (row[0],))
     db.commit()
     await msg.answer(f"Поиск «{html.escape(row[3] or 'поиск')}» удалён. Номера в /list обновились.")
 
@@ -404,8 +469,8 @@ async def cmd_check(msg: Message):
     if not allowed(msg):
         return
     await msg.answer("Проверяю…")
-    await run_check()
-    await msg.answer("Проверка завершена.")
+    report = await run_check(chat_id=msg.chat.id)
+    await msg.answer(report.text())
 
 
 @dp.message()
@@ -429,85 +494,183 @@ def passes_filters(item: Item, mn: int, mx: int, exclude: str) -> bool:
 async def notify(chat_id: int, search_id: int, search_title: str | None, item: Item):
     price = rub(item.price) if item.price else "цена не указана"
     caption = (
-        f"🆕 <b>{html.escape(item.title)}</b>\n"
-        f"💰 {price}\n"
-        f"📍 {html.escape(item.place or '—')} · {html.escape(item.date or '')}\n"
+        f"<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>{html.escape(item.title[:180])}</b>\n"
+        f"<tg-emoji emoji-id='5904462880941545555'>🪙</tg-emoji> {price}\n"
+        f"<tg-emoji emoji-id='6042011682497106307'>📍</tg-emoji> {html.escape((item.place or '—')[:100])} · {html.escape((item.date or '')[:80])}\n"
         f"{price_comment(search_id, item.price)}\n"
         f"<a href=\"{html.escape(item.url)}\">Открыть на Авито</a>"
-        f" · #{search_num(chat_id, search_id)} {html.escape(search_title or '')}"
+        f" · #{search_num(chat_id, search_id)} {html.escape((search_title or '')[:100])}"
     )
     try:
         if item.image:
-            await bot.send_photo(chat_id, item.image, caption=caption[:1024])
+            if len(html.unescape(re.sub(r"<[^>]*>", "", caption))) > 1024:
+                await bot.send_message(chat_id, caption, disable_web_page_preview=False)
+                return
+            await bot.send_photo(chat_id, item.image, caption=caption)
             return
     except Exception:
         pass
     await bot.send_message(chat_id, caption, disable_web_page_preview=False)
 
 
+@dataclass
+class CheckReport:
+    checked: int = 0
+    found: int = 0
+    sent: int = 0
+    filtered: int = 0
+    errors: list[str] = field(default_factory=list)
+    skipped: str = ""
+
+    def text(self) -> str:
+        if self.skipped:
+            return self.skipped
+        lines = [
+            f"Проверено поисков: {self.checked}. Объявлений на страницах: {self.found}.",
+            f"Отправлено: {self.sent}. Новых исключено фильтрами: {self.filtered}.",
+        ]
+        if connection_note:
+            lines.append(connection_note)
+        lines.extend(self.errors)
+        if not self.checked and not self.errors:
+            lines.append("Поисков нет. Пришли ссылку с Авито.")
+        return html.escape("\n".join(lines))
+
+
 blocked_until = 0.0
 block_streak = 0
+error_notices: dict[int, tuple[str, float]] = {}
 
 
-async def run_check():
-    global blocked_until, block_streak
-    if check_lock.locked():
+async def report_error(chat_id: int, sid: int, reason: str):
+    previous, when = error_notices.get(sid, ("", 0.0))
+    if reason == previous and time.time() - when < 3600:
         return
+    try:
+        await bot.send_message(
+            chat_id, html.escape(f"Поиск #{search_num(chat_id, sid)}: {reason}")
+        )
+        error_notices[sid] = (reason, time.time())
+    except Exception:
+        log.warning("Не удалось сообщить об ошибке поиска #%s", sid)
+
+
+async def deliver_pending(sid: int, chat_id: int, title: str | None,
+                          mn: int, mx: int, exclude: str, report: CheckReport) -> bool:
+    rows = db.execute(
+        "SELECT item_id, payload FROM pending_notifications WHERE search_id=? "
+        "ORDER BY created_at, rowid", (sid,),
+    ).fetchall()
+    for item_id, payload in rows:
+        item = Item(**json.loads(payload))
+        if passes_filters(item, mn, mx, exclude):
+            try:
+                await notify(chat_id, sid, title, item)
+            except Exception:
+                # Keep the payload even when the listing disappears from the next page.
+                log.warning("Ошибка доставки объявления для поиска #%s; сохранено для повтора", sid)
+                report.errors.append(
+                    f"Поиск #{search_num(chat_id, sid)}: не удалось отправить объявление "
+                    "в Telegram. Оно сохранено для повторной отправки."
+                )
+                return False
+            report.sent += 1
+            await asyncio.sleep(0.5)
+        else:
+            report.filtered += 1
+        db.execute(
+            "DELETE FROM pending_notifications WHERE search_id=? AND item_id=?", (sid, item_id)
+        )
+        db.commit()
+    return True
+
+
+async def run_check(chat_id: int | None = None) -> CheckReport:
+    global blocked_until, block_streak
+    report = CheckReport()
+    if check_lock.locked():
+        report.skipped = "Проверка уже идёт. Попробуй /check чуть позже."
+        return report
     async with check_lock:
-        if time.time() < blocked_until:
-            return
+        query = (
+            "SELECT id, chat_id, url, title, min_price, max_price, exclude, initialized "
+            "FROM searches"
+        )
         searches = db.execute(
-            "SELECT id, chat_id, url, title, min_price, max_price, exclude, initialized FROM searches"
+            query + (" WHERE chat_id=?" if chat_id is not None else ""),
+            (chat_id,) if chat_id is not None else (),
         ).fetchall()
-        async with AsyncSession(impersonate="chrome") as session:
-            for sid, chat_id, url, title, mn, mx, exclude, initialized in searches:
+        async with AsyncSession(impersonate="chrome", trust_env=False) as session:
+            for sid, owner, url, title, mn, mx, exclude, initialized in searches:
+                # Retry Telegram independently of Avito availability and its backoff.
+                delivery_ok = await deliver_pending(sid, owner, title, mn, mx, exclude, report)
+                if time.time() < blocked_until:
+                    report.errors.append(
+                        f"Поиск #{search_num(owner, sid)}: пауза после ограничения Авито, "
+                        f"ещё {max(1, int(blocked_until - time.time()))} с."
+                    )
+                    continue
                 try:
                     items = await fetch(session, url)
-                    block_streak = 0
-                except Blocked as e:
-                    block_streak += 1
-                    pause = min(3600, 300 * 2 ** (block_streak - 1))
-                    blocked_until = time.time() + pause
-                    log.warning("Авито ограничил доступ (%s), пауза %s с", e, pause)
-                    if block_streak == 1:
-                        await bot.send_message(
-                            chat_id,
-                            f"⚠️ Авито временно ограничил доступ, повторю через {pause // 60} мин. "
-                            "Если повторяется — увеличь CHECK_INTERVAL или задай PROXY.",
-                        )
-                    return
-                except Exception as e:
-                    log.exception("Ошибка поиска #%s: %s", sid, e)
+                except FetchError as exc:
+                    reason = str(exc)
+                    if isinstance(exc, Blocked):
+                        block_streak = min(block_streak + 1, 5)
+                        pause = min(3600, 300 * 2 ** (block_streak - 1))
+                        blocked_until = time.time() + pause
+                        reason += f" Повтор через {pause // 60} мин."
+                    report.errors.append(f"Поиск #{search_num(owner, sid)}: {reason}")
+                    log.warning("Ошибка поиска #%s: %s", sid, reason)
+                    await report_error(owner, sid, reason)
+                    continue
+                except Exception:
+                    reason = "Внутренняя ошибка проверки. Нужна проверка журналов Render."
+                    log.error("Неожиданная ошибка поиска #%s", sid)
+                    report.errors.append(f"Поиск #{search_num(owner, sid)}: {reason}")
+                    await report_error(owner, sid, reason)
                     continue
 
+                block_streak = 0
+                blocked_until = 0.0
+                error_notices.pop(sid, None)
+                report.checked += 1
+                report.found += len(items)
                 now = int(time.time())
-                new_items = []
-                for it in items:
-                    cur = db.execute(
-                        "INSERT OR IGNORE INTO items(search_id, item_id, price, seen_at) VALUES(?,?,?,?)",
-                        (sid, it.id, it.price, now),
-                    )
-                    if cur.rowcount:
-                        new_items.append(it)
-                db.commit()
+                # Store seen state and the delivery queue in one transaction.
+                with db:
+                    for item in reversed(items):
+                        cur = db.execute(
+                            "INSERT OR IGNORE INTO items(search_id, item_id, price, seen_at) "
+                            "VALUES(?,?,?,?)", (sid, item.id, item.price, now),
+                        )
+                        if cur.rowcount and initialized:
+                            if passes_filters(item, mn, mx, exclude):
+                                db.execute(
+                                    "INSERT OR IGNORE INTO pending_notifications"
+                                    "(search_id, item_id, payload, created_at) VALUES(?,?,?,?)",
+                                    (sid, item.id, json.dumps(asdict(item), ensure_ascii=False), now),
+                                )
+                            else:
+                                report.filtered += 1
+                    if not initialized:
+                        db.execute("UPDATE searches SET initialized=1 WHERE id=?", (sid,))
 
                 if not initialized:
-                    db.execute("UPDATE searches SET initialized=1 WHERE id=?", (sid,))
-                    db.commit()
-                    await bot.send_message(
-                        chat_id,
-                        f"Поиск #{search_num(chat_id, sid)} «{html.escape(title or 'поиск')}»: "
-                        f"запомнил {len(items)} текущих объявлений. "
-                        f"Медиану и торг смотри в /stats {search_num(chat_id, sid)}",
-                    )
-                    continue
-
-                for it in reversed(new_items):  # старые — первыми
-                    if passes_filters(it, mn, mx, exclude):
-                        await notify(chat_id, sid, title, it)
-                        await asyncio.sleep(0.5)
-
-                await asyncio.sleep(random.uniform(4, 9))  # пауза между поисками
+                    try:
+                        await bot.send_message(
+                            owner,
+                            f"Поиск #{search_num(owner, sid)} «{html.escape(title or 'поиск')}»: "
+                            f"запомнил {len(items)} текущих объявлений. "
+                            "Дальше присылаю только новые. Команда /check покажет результат проверки.",
+                        )
+                    except Exception:
+                        log.warning("Не удалось сообщить об инициализации поиска #%s", sid)
+                else:
+                    # Avoid two attempts in one cycle if a previous pending send failed.
+                    if delivery_ok:
+                        await deliver_pending(sid, owner, title, mn, mx, exclude, report)
+                await asyncio.sleep(random.uniform(4, 9))
+    return report
 
 
 async def scheduler():
@@ -596,3 +759,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
