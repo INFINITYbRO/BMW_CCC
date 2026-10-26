@@ -72,6 +72,59 @@ class ReaderParserTests(unittest.TestCase):
 
 
 class ReaderNetworkTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.sleep_patch = patch.object(bot.asyncio, "sleep", new=AsyncMock())
+        self.sleep_patch.start()
+
+    async def asyncTearDown(self):
+        self.sleep_patch.stop()
+
+    async def test_redirect_metadata_with_real_cards_is_usable(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response(target_status=302)))
+        items = await bot.fetch_reader(session, URL)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(session.get.await_count, 1)
+        self.assertTrue(session.get.await_args.kwargs["allow_redirects"])
+
+    async def test_redirect_document_retries_with_browser_then_reads_final_cards(self):
+        session = SimpleNamespace(get=AsyncMock(side_effect=[
+            response(target_status=302, content="Redirecting…"), response(),
+        ]))
+        self.assertEqual(len(await bot.fetch_reader(session, URL)), 3)
+        self.assertEqual(session.get.await_count, 2)
+        headers = session.get.await_args_list[1].kwargs["headers"]
+        self.assertEqual(headers["X-Engine"], "browser")
+        self.assertEqual(headers["X-Respond-Timing"], "resource-idle")
+
+    async def test_unresolved_redirect_is_not_an_empty_success(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response(
+            target_status=302, content="Ничего не найдено")))
+        with self.assertRaisesRegex(bot.FetchError, "перенаправил"):
+            await bot.fetch_reader(session, URL)
+        self.assertEqual(session.get.await_count, 2)
+
+    async def test_outer_redirect_is_retried(self):
+        session = SimpleNamespace(get=AsyncMock(side_effect=[response(status=302), response()]))
+        self.assertEqual(len(await bot.fetch_reader(session, URL)), 3)
+
+    async def test_partial_content_is_retried_once(self):
+        session = SimpleNamespace(get=AsyncMock(side_effect=[response(content="Загрузка…"), response()]))
+        self.assertEqual(len(await bot.fetch_reader(session, URL)), 3)
+        self.assertEqual(session.get.await_count, 2)
+
+    async def test_redirect_to_other_search_is_rejected(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response(
+            target_status=302, url="https://www.avito.ru/sochi?q=other&s=104")))
+        with self.assertRaises(bot.FetchError):
+            await bot.fetch_reader(session, URL)
+        self.assertEqual(session.get.await_count, 1)
+
+    async def test_redirect_without_a_priced_card_does_not_initialize_search(self):
+        content = "[Переход](https://www.avito.ru/sochi/games/vita_1234567892)"
+        session = SimpleNamespace(get=AsyncMock(return_value=response(target_status=302, content=content)))
+        with self.assertRaisesRegex(bot.FetchError, "перенаправил"):
+            await bot.fetch_reader(session, URL)
+
     async def test_fresh_public_url_without_any_proxy_or_credentials(self):
         session = SimpleNamespace(get=AsyncMock(return_value=response()))
         with patch.object(bot, "FETCH_MODE", "reader"), patch.object(bot, "PROXY", "secret-proxy"):
