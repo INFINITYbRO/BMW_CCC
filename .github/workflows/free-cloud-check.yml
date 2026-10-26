@@ -1,0 +1,48 @@
+name: Free reader integration check
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/free-cloud-check.yml'
+      - 'tools/cloud_probe.py'
+      - 'bot.py'
+      - 'tests/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: free-cloud-check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install existing bot dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Offline regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Test fresh public search through free Reader
+        id: reader
+        continue-on-error: true
+        run: python tools/cloud_probe.py --method reader
+      - name: Test direct access to public Avito search
+        if: steps.reader.outcome == 'failure'
+        id: curl
+        continue-on-error: true
+        run: python tools/cloud_probe.py --method curl
+      - name: Install browser for normal page rendering
+        if: steps.reader.outcome == 'failure' && steps.curl.outcome == 'failure'
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Check normal browser access without solving CAPTCHA
+        if: steps.reader.outcome == 'failure' && steps.curl.outcome == 'failure'
+        run: python tools/cloud_probe.py --method browser
+

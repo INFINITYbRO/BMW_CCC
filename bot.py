@@ -190,7 +190,7 @@ def network_error(exc: RequestException, via_proxy: bool) -> str:
     return "Не удалось подключиться к Авито. Проверь сеть и настройку PROXY на Render."
 
 
-async def fetch(session: AsyncSession, url: str) -> list[Item]:
+async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
     global proxy_retry_at, connection_note
     via_proxy = bool(PROXY) and time.time() >= proxy_retry_at
     options = {"proxy": PROXY} if via_proxy else {"proxies": {"all": ""}}
@@ -230,6 +230,110 @@ async def fetch(session: AsyncSession, url: str) -> list[Item]:
             "Не удалось прочитать объявления: изменилась страница Авито или показана капча."
         )
     return items
+
+
+# ---------------------------------------------------------------- free cloud reader
+
+FETCH_MODE = os.getenv("AVITO_FETCH_MODE", "reader").lower()
+if FETCH_MODE not in ("reader", "direct"):
+    raise ValueError("AVITO_FETCH_MODE must be reader or direct")
+if FETCH_MODE == "reader":
+    CHECK_INTERVAL = max(CHECK_INTERVAL, 900)
+
+
+def parse_reader_items(markdown: str) -> list[Item]:
+    """Read listing cards from Reader's deterministic Markdown, without an LLM."""
+    matches = list(re.finditer(
+        r"\]\((https?://(?:www\.)?avito\.ru/[^\s)]*_\d{8,}(?:\?[^\s)]*)?)\)",
+        markdown,
+    ))
+    result: list[Item] = []
+    seen: set[str] = set()
+    for index, match in enumerate(matches):
+        parts = urlsplit(html.unescape(match[1]))
+        item_match = re.search(r"_(\d{8,})$", parts.path)
+        if not item_match or item_match[1] in seen:
+            continue
+        start = markdown.rfind("\n", 0, match.start()) + 1
+        label = markdown[start:match.start()]
+        end = (markdown.rfind("\n", match.end(), matches[index + 1].start()) + 1
+               if index + 1 < len(matches) else len(markdown))
+        details = markdown[match.end():end]
+        image_match = re.search(r"!\[([^\]]+)\]\((https?://[^\s)]+)\)", label)
+        title = ""
+        place = ""
+        image = None
+        if image_match:
+            alt = re.sub(r"^Image\s+\d+:\s*", "", image_match[1])
+            title, separator, place = alt.rpartition(", ")
+            if not separator:
+                title, place = alt, ""
+            image = html.unescape(image_match[2])
+        else:
+            title = re.sub(r"^[\s\[*#]+", "", label).strip(" ]*")
+        if not title or re.fullmatch(r"\*?\s*Ещё \d+ фото", title):
+            title = parts.path.rsplit("/", 1)[-1].rsplit("_", 1)[0].replace("_", " ")
+        price_match = re.search(r"(\d[\d\s\u00a0\u202f]*)\s*(?:₽|руб\.?)", details)
+        price = int(re.sub(r"\D", "", price_match[1])) if price_match else 0
+        date_match = re.search(
+            r"(?im)^\s*(сегодня[^\n]*|вчера[^\n]*|\d+\s+(?:минут[уы]?|час[аов]*|дн[яей]*)\s+назад)\s*$",
+            details,
+        )
+        seen.add(item_match[1])
+        result.append(Item(
+            item_match[1], html.unescape(title), price,
+            urlunsplit(("https", "www.avito.ru", parts.path, "", "")),
+            html.unescape(place), date_match[1].strip() if date_match else "",
+            image, re.sub(r"[\*_#]", "", details).strip()[:3000],
+        ))
+    return result
+
+
+async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
+    # Only the public search URL is sent. Never forward Telegram credentials,
+    # the configured proxy, or an Avito user's cookies to the reader service.
+    target = normalize_url(url)
+    try:
+        response = await session.get(
+            "https://r.jina.ai/" + target,
+            headers={"Accept": "application/json", "X-Cache-Tolerance": "0", "X-Timeout": "45"},
+            timeout=65, proxies={"all": ""},
+        )
+    except RequestException:
+        raise FetchError("Бесплатный сервис чтения временно недоступен. Повторю позже.") from None
+    if response.status_code == 429:
+        raise FetchError("Бесплатный сервис чтения ограничил частоту запросов. Повторю позже.")
+    if response.status_code != 200:
+        raise FetchError(f"Сервис чтения вернул HTTP {response.status_code}. Повторю позже.")
+    try:
+        payload = response.json()
+        data = payload["data"]
+        if not isinstance(data, dict) or not isinstance(data.get("content", ""), str):
+            raise ValueError("Invalid reader response")
+        if normalize_url(data["url"]) != target:
+            raise ValueError("Reader returned another search")
+        status = data["httpStatus"]
+        if type(status) is not int:
+            raise ValueError("Invalid target HTTP status")
+        content = data.get("content", "")
+    except (ValueError, TypeError, KeyError):
+        raise FetchError("Не удалось прочитать ответ бесплатного сервиса.") from None
+    if status != 200:
+        raise FetchError(
+            f"Авито отклонил запрос сервиса чтения (HTTP {int(status)}). Повторю позже."
+        )
+    items = parse_reader_items(content)
+    lowered = content.lower()
+    if not items and not any(text in lowered for text in (
+            "ничего не найдено", "ничего не нашлось", "нет объявлений")):
+        raise FetchError("Сервис чтения не вернул карточки объявлений. Повторю позже.")
+    return items
+
+
+async def fetch(session: AsyncSession, url: str) -> list[Item]:
+    if FETCH_MODE == "reader":
+        return await fetch_reader(session, url)
+    return await fetch_direct(session, url)
 
 
 # ---------------------------------------------------------------- логика цен
@@ -635,6 +739,7 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                 error_notices.pop(sid, None)
                 report.checked += 1
                 report.found += len(items)
+                log.info("Поиск #%s: прочитано %s объявлений, источник %s", sid, len(items), FETCH_MODE)
                 now = int(time.time())
                 # Store seen state and the delivery queue in one transaction.
                 with db:
@@ -750,6 +855,7 @@ async def keep_awake():
 
 async def main():
     await start_web()
+    log.info("Источник объявлений: %s; интервал не меньше %s с", FETCH_MODE, CHECK_INTERVAL)
     seed_searches()
     asyncio.create_task(keep_awake())
     await wait_for_telegram()
