@@ -49,7 +49,8 @@ class ParserTests(unittest.TestCase):
 class NetworkTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.config = patch.multiple(bot, PROXY="http://secret:password@proxy.invalid:8080",
-                                     PROXY_FALLBACK=True, proxy_retry_at=0.0, connection_note="")
+                                     PROXY_FALLBACK=True, proxy_retry_at=0.0, connection_note="",
+                                     FETCH_MODE="direct")
         self.config.start()
 
     async def asyncTearDown(self):

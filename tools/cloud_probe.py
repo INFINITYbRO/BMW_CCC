@@ -32,6 +32,23 @@ def summarize(method, status, page):
     return result
 
 
+async def reader_check():
+    os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    os.environ["DB_PATH"] = ":memory:"
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import bot
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate="chrome", trust_env=False) as session:
+        try:
+            items = await bot.fetch_reader(session, bot.normalize_url(URL))
+            return {"method": "reader", "parsed_cards": len(items),
+                    "priced_cards": sum(bool(item.price) for item in items),
+                    "success": bool(items), "fresh_page_required": True}
+        except bot.FetchError as exc:
+            return {"method": "reader", "success": False, "reason": str(exc)}
+
+
 def curl_check():
     from curl_cffi import requests
     try:
@@ -60,9 +77,12 @@ async def browser_check():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", choices=("curl", "browser"), required=True)
+    parser.add_argument("--method", choices=("curl", "browser", "reader"), required=True)
     args = parser.parse_args()
-    result = curl_check() if args.method == "curl" else asyncio.run(browser_check())
+    if args.method == "reader":
+        result = asyncio.run(reader_check())
+    else:
+        result = curl_check() if args.method == "curl" else asyncio.run(browser_check())
     output = json.dumps(result, ensure_ascii=False)
     print(output, flush=True)
     if os.getenv("GITHUB_STEP_SUMMARY"):
@@ -70,3 +90,4 @@ if __name__ == "__main__":
             summary.write("### Avito free-cloud connectivity check\n\n")
             summary.write("```json\n" + output + "\n```\n")
     raise SystemExit(0 if result["success"] else 1)
+
