@@ -75,8 +75,11 @@ class ReaderNetworkTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.sleep_patch = patch.object(bot.asyncio, "sleep", new=AsyncMock())
         self.sleep_patch.start()
+        self.snapshot_patch = patch.object(bot, "reader_snapshots", {})
+        self.snapshot_patch.start()
 
     async def asyncTearDown(self):
+        self.snapshot_patch.stop()
         self.sleep_patch.stop()
 
     async def test_redirect_metadata_with_real_cards_is_usable(self):
@@ -141,6 +144,12 @@ class ReaderNetworkTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(get=AsyncMock(return_value=response(target_status=403)))
         with self.assertRaisesRegex(bot.FetchError, "HTTP 403"):
             await bot.fetch_reader(session, URL)
+
+    async def test_target_439_is_not_retried_or_accepted_as_cards(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response(target_status=439)))
+        with self.assertRaisesRegex(bot.FetchError, "временно ограничил.*HTTP 439"):
+            await bot.fetch_reader(session, URL)
+        self.assertEqual(session.get.await_count, 1)
 
     async def test_wrong_search_response_is_rejected(self):
         session = SimpleNamespace(get=AsyncMock(return_value=response(
