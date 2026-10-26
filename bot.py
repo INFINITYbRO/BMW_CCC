@@ -293,41 +293,70 @@ async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
     # Only the public search URL is sent. Never forward Telegram credentials,
     # the configured proxy, or an Avito user's cookies to the reader service.
     target = normalize_url(url)
-    try:
-        response = await session.get(
-            "https://r.jina.ai/" + target,
-            headers={"Accept": "application/json", "X-Cache-Tolerance": "0", "X-Timeout": "45"},
-            timeout=65, proxies={"all": ""},
-        )
-    except RequestException:
-        raise FetchError("Бесплатный сервис чтения временно недоступен. Повторю позже.") from None
-    if response.status_code == 429:
-        raise FetchError("Бесплатный сервис чтения ограничил частоту запросов. Повторю позже.")
-    if response.status_code != 200:
-        raise FetchError(f"Сервис чтения вернул HTTP {response.status_code}. Повторю позже.")
-    try:
-        payload = response.json()
-        data = payload["data"]
-        if not isinstance(data, dict) or not isinstance(data.get("content", ""), str):
-            raise ValueError("Invalid reader response")
-        if normalize_url(data["url"]) != target:
-            raise ValueError("Reader returned another search")
-        status = data["httpStatus"]
-        if type(status) is not int:
-            raise ValueError("Invalid target HTTP status")
-        content = data.get("content", "")
-    except (ValueError, TypeError, KeyError):
-        raise FetchError("Не удалось прочитать ответ бесплатного сервиса.") from None
-    if status != 200:
-        raise FetchError(
-            f"Авито отклонил запрос сервиса чтения (HTTP {int(status)}). Повторю позже."
-        )
-    items = parse_reader_items(content)
-    lowered = content.lower()
-    if not items and not any(text in lowered for text in (
-            "ничего не найдено", "ничего не нашлось", "нет объявлений")):
+    redirects = (301, 302, 303, 307, 308)
+    for attempt in range(2):
+        headers = {
+            "Accept": "application/json", "X-Cache-Tolerance": "0", "X-Timeout": "45",
+        }
+        if attempt:
+            # A redirect or partial document may need ordinary browser rendering.
+            headers.update({"X-Engine": "browser", "X-Respond-Timing": "resource-idle"})
+        try:
+            response = await session.get(
+                "https://r.jina.ai/" + target, headers=headers,
+                timeout=65, proxies={"all": ""}, allow_redirects=True, max_redirects=5,
+            )
+        except RequestException:
+            raise FetchError("Бесплатный сервис чтения временно недоступен. Повторю позже.") from None
+        if response.status_code == 429:
+            raise FetchError("Бесплатный сервис чтения ограничил частоту запросов. Повторю позже.")
+        if response.status_code in redirects and not attempt:
+            await asyncio.sleep(2)
+            continue
+        if response.status_code != 200:
+            raise FetchError(f"Сервис чтения вернул HTTP {response.status_code}. Повторю позже.")
+        try:
+            payload = response.json()
+            data = payload["data"]
+            if not isinstance(data, dict) or not isinstance(data.get("content", ""), str):
+                raise ValueError("Invalid reader response")
+            if normalize_url(data["url"]) != target:
+                raise ValueError("Reader returned another search")
+            status = data["httpStatus"]
+            if type(status) is not int:
+                raise ValueError("Invalid target HTTP status")
+            content = data.get("content", "")
+        except (ValueError, TypeError, KeyError):
+            raise FetchError("Не удалось прочитать ответ бесплатного сервиса.") from None
+
+        if status != 200 and status not in redirects:
+            raise FetchError(
+                f"Авито отклонил запрос сервиса чтения (HTTP {status}). Повторю позже."
+            )
+        items = parse_reader_items(content)
+        if status in redirects:
+            # Reader can report an intermediate redirect while already returning
+            # the final listing content. Require actual priced cards as evidence.
+            if items and any(item.price > 0 for item in items):
+                log.info("Reader: HTTP %s после перенаправления, прочитано %s объявлений",
+                         status, len(items))
+                return items
+            if not attempt:
+                await asyncio.sleep(2)
+                continue
+            raise FetchError(
+                f"Авито перенаправил запрос (HTTP {status}), "
+                "но страницу объявлений прочитать не удалось. Повторю позже."
+            )
+        lowered = content.lower()
+        if items or any(text in lowered for text in (
+                "ничего не найдено", "ничего не нашлось", "нет объявлений")):
+            return items
+        if not attempt:
+            await asyncio.sleep(2)
+            continue
         raise FetchError("Сервис чтения не вернул карточки объявлений. Повторю позже.")
-    return items
+    raise FetchError("Не удалось завершить переход к странице объявлений. Повторю позже.")
 
 
 async def fetch(session: AsyncSession, url: str) -> list[Item]:
