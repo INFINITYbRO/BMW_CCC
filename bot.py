@@ -14,7 +14,7 @@ Avito watcher — Telegram-бот, который следит за поиско
   /price N мин макс            — фильтр по цене (0 = без ограничения)
   /exclude N слово, слово      — не присылать объявления с этими словами
   /stats N                     — медиана цен и рекомендуемый торг
-  /check                       — проверить все поиски прямо сейчас
+  /check                       — проверить поиски и показать последний результат
 """
 import asyncio
 import html
@@ -241,6 +241,41 @@ if FETCH_MODE == "reader":
     CHECK_INTERVAL = max(CHECK_INTERVAL, 300)
 
 
+READER_REFRESH_INTERVAL = max(300, CHECK_INTERVAL)
+
+
+@dataclass
+class ReaderSnapshot:
+    started_at: float
+    items: list[Item] | None
+    error: str = ""
+    last_success_at: float | None = None
+    last_success_count: int = 0
+
+
+reader_snapshots: dict[str, ReaderSnapshot] = {}
+
+
+def recent_reader_snapshot(url: str) -> ReaderSnapshot | None:
+    snapshot = reader_snapshots.get(normalize_url(url))
+    if snapshot and time.monotonic() - snapshot.started_at < READER_REFRESH_INTERVAL:
+        return snapshot
+    return None
+
+
+def reader_snapshot_note(sid: int, owner: int, snapshot: ReaderSnapshot) -> str:
+    now = time.monotonic()
+    remaining = max(1, READER_REFRESH_INTERVAL - int(now - snapshot.started_at))
+    note = f"Поиск #{search_num(owner, sid)}: новый запрос к источнику через {remaining} с."
+    if snapshot.last_success_at is not None:
+        age = max(0, int(now - snapshot.last_success_at))
+        note += (
+            f" Последняя успешная проверка — {age} с назад, "
+            f"объявлений: {snapshot.last_success_count}."
+        )
+    return note
+
+
 def parse_reader_items(markdown: str) -> list[Item]:
     """Read listing cards from Reader's deterministic Markdown, without an LLM."""
     matches = list(re.finditer(
@@ -329,6 +364,11 @@ async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
         except (ValueError, TypeError, KeyError):
             raise FetchError("Не удалось прочитать ответ бесплатного сервиса.") from None
 
+        if status in (403, 429, 439):
+            raise FetchError(
+                f"Авито временно ограничил доступ сервису чтения (HTTP {status}). "
+                "Автопроверки продолжаются; повторю позже."
+            )
         if status != 200 and status not in redirects:
             raise FetchError(
                 f"Авито отклонил запрос сервиса чтения (HTTP {status}). Повторю позже."
@@ -361,7 +401,29 @@ async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
 
 async def fetch(session: AsyncSession, url: str) -> list[Item]:
     if FETCH_MODE == "reader":
-        return await fetch_reader(session, url)
+        target = normalize_url(url)
+        snapshot = recent_reader_snapshot(target)
+        if snapshot:
+            if snapshot.error:
+                raise FetchError(snapshot.error)
+            return list(snapshot.items or [])
+        previous = reader_snapshots.get(target)
+        started = time.monotonic()
+        try:
+            items = await fetch_reader(session, target)
+        except FetchError as exc:
+            # Also throttle failed attempts. Repeated /check must not hammer a
+            # blocked source or replace its last successful data with zero ads.
+            reader_snapshots[target] = ReaderSnapshot(
+                started, None, str(exc),
+                previous.last_success_at if previous else None,
+                previous.last_success_count if previous else 0,
+            )
+            raise
+        reader_snapshots[target] = ReaderSnapshot(
+            started, items, last_success_at=time.monotonic(), last_success_count=len(items),
+        )
+        return items
     return await fetch_direct(session, url)
 
 
@@ -653,6 +715,7 @@ class CheckReport:
     sent: int = 0
     filtered: int = 0
     errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     skipped: str = ""
 
     def text(self) -> str:
@@ -665,6 +728,7 @@ class CheckReport:
         if connection_note:
             lines.append(connection_note)
         lines.extend(self.errors)
+        lines.extend(self.notes)
         if not self.checked and not self.errors:
             lines.append("Поисков нет. Пришли ссылку с Авито.")
         return html.escape("\n".join(lines))
@@ -744,6 +808,7 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                     )
                     continue
                 try:
+                    cached = recent_reader_snapshot(url) if FETCH_MODE == "reader" else None
                     items = await fetch(session, url)
                 except FetchError as exc:
                     reason = str(exc)
@@ -754,6 +819,10 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                         reason += f" Повтор через {pause // 60} мин."
                     report.errors.append(f"Поиск #{search_num(owner, sid)}: {reason}")
                     log.warning("Ошибка поиска #%s: %s", sid, reason)
+                    if FETCH_MODE == "reader":
+                        snapshot = recent_reader_snapshot(url)
+                        if snapshot:
+                            report.notes.append(reader_snapshot_note(sid, owner, snapshot))
                     await report_error(owner, sid, reason)
                     continue
                 except Exception:
@@ -768,7 +837,12 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                 error_notices.pop(sid, None)
                 report.checked += 1
                 report.found += len(items)
-                log.info("Поиск #%s: прочитано %s объявлений, источник %s", sid, len(items), FETCH_MODE)
+                if cached:
+                    report.notes.append(reader_snapshot_note(sid, owner, cached))
+                    log.info("Поиск #%s: последний ответ, %s объявлений; новый запрос не нужен",
+                             sid, len(items))
+                else:
+                    log.info("Поиск #%s: прочитано %s объявлений, источник %s", sid, len(items), FETCH_MODE)
                 now = int(time.time())
                 # Store seen state and the delivery queue in one transaction.
                 with db:
@@ -807,6 +881,21 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
     return report
 
 
+def next_cycle_delay(started: float) -> float:
+    now = time.monotonic()
+    remaining = CHECK_INTERVAL - (now - started)
+    if remaining <= 0:
+        return CHECK_INTERVAL
+    if FETCH_MODE == "reader":
+        # A manual check can move a search's next refresh between regular cycles.
+        # Wake at that deadline instead of delaying its next fetch for 10 minutes.
+        for (url,) in db.execute("SELECT DISTINCT url FROM searches"):
+            snapshot = recent_reader_snapshot(url)
+            if snapshot:
+                remaining = min(remaining, snapshot.started_at + READER_REFRESH_INTERVAL - now)
+    return max(0.01, remaining)
+
+
 async def scheduler():
     while True:
         started = time.monotonic()
@@ -815,9 +904,8 @@ async def scheduler():
             await run_check()
         except Exception:
             log.exception("Сбой цикла проверки")
-        remaining = CHECK_INTERVAL - (time.monotonic() - started)
         # Count from the previous start and avoid bursts after an overlong cycle.
-        await asyncio.sleep(remaining if remaining > 0 else CHECK_INTERVAL)
+        await asyncio.sleep(next_cycle_delay(started))
 
 
 async def wait_for_telegram():

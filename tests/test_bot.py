@@ -115,6 +115,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "block_streak", 0),
             patch.object(bot, "connection_note", ""),
             patch.object(bot, "error_notices", {}),
+            patch.object(bot, "reader_snapshots", {}),
+            patch.object(bot, "FETCH_MODE", "direct"),
             patch.object(bot, "AsyncSession", return_value=self.session),
             patch.object(bot.asyncio, "sleep", new=AsyncMock()),
         ]
@@ -222,6 +224,101 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             report = await bot.run_check()
         self.assertEqual(report.sent, 1)
         self.assertEqual(self.pending(), 1)
+
+    async def test_manual_reader_check_reuses_auto_result_with_visible_age(self):
+        self.search(initialized=0)
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(return_value=[item()])) as reader:
+            await bot.run_check()
+            report = await bot.run_check(11)
+        self.assertEqual(reader.await_count, 1)
+        self.assertEqual((report.checked, report.found, report.sent), (1, 1, 0))
+        self.assertIn("Последняя успешная проверка", report.text())
+        self.assertIn("новый запрос", report.text())
+
+    async def test_expired_reader_result_fetches_fresh_and_delivers_new_item(self):
+        self.search(initialized=0)
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(side_effect=[[item("old")], [item("new")]])) as reader:
+            await bot.run_check(11)
+            next(iter(bot.reader_snapshots.values())).started_at -= 301
+            report = await bot.run_check(11)
+        self.assertEqual(reader.await_count, 2)
+        self.assertEqual(report.sent, 1)
+        self.assertEqual(report.notes, [])
+
+    async def test_repeated_reader_failure_waits_and_does_not_initialize_empty_search(self):
+        sid = self.search(initialized=0)
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(side_effect=bot.FetchError("HTTP 439"))) as reader:
+            await bot.run_check(11)
+            report = await bot.run_check(11)
+        self.assertEqual(reader.await_count, 1)
+        self.assertIn("HTTP 439", report.text())
+        self.assertEqual(report.checked, 0)
+        self.assertEqual(self.db.execute("SELECT initialized FROM searches WHERE id=?", (sid,)).fetchone()[0], 0)
+        self.assertEqual(self.telegram.send_message.await_count, 1)
+
+    async def test_reader_error_preserves_last_success_time_and_count(self):
+        self.search()
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(side_effect=[[item()], bot.FetchError("HTTP 439")])) as reader:
+            await bot.run_check(11)
+            next(iter(bot.reader_snapshots.values())).started_at -= 301
+            report = await bot.run_check(11)
+            await bot.run_check(11)
+        self.assertEqual(reader.await_count, 2)
+        self.assertIn("Последняя успешная проверка", report.text())
+        self.assertIn("объявлений: 1", report.text())
+        self.assertIn("HTTP 439", report.text())
+
+    async def test_shared_reader_url_still_applies_each_chats_filters_and_delivery(self):
+        self.search(chat=11)
+        self.search(chat=22, exclude="vita")
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(return_value=[item()])) as reader:
+            report = await bot.run_check()
+        self.assertEqual(reader.await_count, 1)
+        self.assertEqual((report.checked, report.sent, report.filtered), (2, 1, 1))
+        self.assertEqual(self.telegram.send_message.await_args.args[0], 11)
+
+    async def test_reader_cache_does_not_delay_pending_telegram_delivery(self):
+        self.search()
+        self.telegram.send_message.side_effect = RuntimeError("Telegram unavailable")
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(return_value=[item()])) as reader:
+            await bot.run_check(11)
+            self.telegram.send_message.side_effect = None
+            report = await bot.run_check(11)
+        self.assertEqual(reader.await_count, 1)
+        self.assertEqual((report.sent, self.pending()), (1, 0))
+
+    async def test_different_reader_searches_are_not_combined(self):
+        self.search(chat=11)
+        sid = self.search(chat=22)
+        self.db.execute("UPDATE searches SET url=? WHERE id=?", ("https://www.avito.ru/sochi?q=switch", sid))
+        self.db.commit()
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(
+                bot, "fetch_reader", new=AsyncMock(return_value=[])) as reader:
+            report = await bot.run_check()
+        self.assertEqual((reader.await_count, report.checked), (2, 2))
+
+    async def test_scheduler_wakes_when_manual_result_expires_between_cycles(self):
+        self.search()
+        now = bot.time.monotonic()
+        url = bot.normalize_url("https://www.avito.ru/sochi?q=ps+vita")
+        bot.reader_snapshots[url] = bot.ReaderSnapshot(now - 250, [])
+        with patch.object(bot, "FETCH_MODE", "reader"):
+            delay = bot.next_cycle_delay(now)
+            self.assertGreater(delay, 48)
+            self.assertLessEqual(delay, 50)
+            self.assertEqual(bot.next_cycle_delay(now - 301), bot.CHECK_INTERVAL)
+
+    async def test_scheduler_ignores_removed_search_cache(self):
+        now = bot.time.monotonic()
+        bot.reader_snapshots[bot.normalize_url("https://www.avito.ru/sochi?q=old")] = bot.ReaderSnapshot(now - 299, [])
+        with patch.object(bot, "FETCH_MODE", "reader"):
+            self.assertGreater(bot.next_cycle_delay(now), 298)
 
 
 if __name__ == "__main__":
