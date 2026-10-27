@@ -33,13 +33,13 @@ async def main():
                         "d.dataset.marker='item-view/item-description';"
                         "d.textContent = document.cookie.includes('browser_fixture=yes') ? 'На запчасти, не включается' : 'NO COOKIE';"
                         "document.body.appendChild(d); }, 50);</script></body></html>")
-            await route.fulfill(status=200, content_type="text/html", body=body)
+            await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
 
         await bot.browser_reader._context.route("https://www.avito.ru/browser-fixture**", fixture)
         items = await bot.fetch_browser(SEARCH)
         assert len(items) == 1 and items[0].price == 9000
         detailed = await bot.read_item_details(None, items[0])
-        assert detailed.description == "На запчасти, не включается"
+        assert detailed.description == "На запчасти, не включается", repr(detailed.description)
         assert not bot.passes_filters(detailed, 0, 0, "не включается")
         print(json.dumps({"success": True, "javascript_cards": len(items),
                           "session_cookie_preserved": True, "full_description_filter": True}))
