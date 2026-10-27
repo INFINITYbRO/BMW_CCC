@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 from avito_parser import (clean_exclusions, is_reserved, normalize_text,
                           parse_details_html, parse_details_markdown)
 from proxy_diagnostics import connect_status, probe_target, proxy_conclusion
+from browser_fetcher import BrowserFetcher, BrowserFetchError, BrowserBlocked
 
 load_dotenv()
 
@@ -282,13 +283,37 @@ async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
 # ---------------------------------------------------------------- free cloud reader
 
 FETCH_MODE = os.getenv("AVITO_FETCH_MODE", "reader").lower()
-if FETCH_MODE not in ("reader", "direct"):
-    raise ValueError("AVITO_FETCH_MODE must be reader or direct")
-if FETCH_MODE == "reader":
+if FETCH_MODE not in ("reader", "direct", "browser"):
+    raise ValueError("AVITO_FETCH_MODE must be reader, direct or browser")
+if FETCH_MODE in ("reader", "browser"):
     CHECK_INTERVAL = max(CHECK_INTERVAL, 300)
 
 
 READER_REFRESH_INTERVAL = max(300, CHECK_INTERVAL)
+browser_reader = BrowserFetcher(PROXY)
+
+
+async def browser_document(url: str, detail: bool = False):
+    try:
+        return await browser_reader.read(url, detail=detail)
+    except BrowserBlocked as exc:
+        raise Blocked(str(exc)) from None
+    except BrowserFetchError as exc:
+        raise FetchError(str(exc)) from None
+
+
+async def fetch_browser(url: str) -> list[Item]:
+    document = await browser_document(url)
+    if document.status != 200:
+        raise FetchError(f"Браузер получил HTTP {document.status} вместо выдачи Авито.")
+    items = parse_items(document.html)
+    if not items:
+        soup = BeautifulSoup(document.html, "lxml")
+        empty = soup.select_one('[data-marker="search-results/empty"]')
+        headings = " ".join(node.get_text(" ", strip=True) for node in soup.select("h1, h2"))
+        if not empty and not re.search(r"ничего не найдено|ничего не нашлось", headings, re.I):
+            raise FetchError("Браузер не получил карточки выдачи: страница не загрузилась или показана проверка доступа.")
+    return items
 
 
 @dataclass
@@ -470,7 +495,7 @@ async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
 
 
 async def fetch(session: AsyncSession, url: str) -> list[Item]:
-    if FETCH_MODE == "reader":
+    if FETCH_MODE in ("reader", "browser"):
         target = normalize_url(url)
         snapshot = recent_reader_snapshot(target)
         if snapshot:
@@ -481,8 +506,11 @@ async def fetch(session: AsyncSession, url: str) -> list[Item]:
         started = time.monotonic()
         try:
             try:
-                items = await fetch_reader(session, target)
+                items = (await fetch_browser(target) if FETCH_MODE == "browser"
+                         else await fetch_reader(session, target))
             except FetchError as reader_error:
+                if FETCH_MODE == "browser":
+                    raise
                 # A Reader IP can be blocked even when the deployment's own IP
                 # works. Try direct access, honouring the existing PROXY options.
                 try:
@@ -516,7 +544,7 @@ detail_snapshots: dict[str, DetailSnapshot] = {}
 
 
 def detail_refresh_interval() -> int:
-    return max(300, CHECK_INTERVAL) if FETCH_MODE == "reader" else max(30, min(60, CHECK_INTERVAL))
+    return max(300, CHECK_INTERVAL) if FETCH_MODE in ("reader", "browser") else max(30, min(60, CHECK_INTERVAL))
 
 
 def remember_details(target: str, snapshot: DetailSnapshot):
@@ -532,8 +560,12 @@ def listing_url(url: str) -> str:
 
 async def read_item_details(session: AsyncSession, item: Item) -> Item:
     target = listing_url(item.url)
-    if FETCH_MODE == "direct":
-        page, status = await fetch_direct_page(session, target, allow_missing=True)
+    if FETCH_MODE in ("direct", "browser"):
+        if FETCH_MODE == "browser":
+            document = await browser_document(target, detail=True)
+            page, status = document.html, document.status
+        else:
+            page, status = await fetch_direct_page(session, target, allow_missing=True)
         if status in (404, 410):
             return replace(item, active=False)
         try:
@@ -910,6 +942,8 @@ async def build_proxy_report(chat_id: int) -> str:
         elif not row:
             lines.append("Чтобы проверить выдачу и описание, добавь свою ссылку поиска.")
         lines.append(proxy_conclusion(control, avito))
+        if FETCH_MODE == "browser":
+            lines.append("Это проверка HTTP-прокси. Браузерную загрузку проверяет /check.")
     return "\n".join(lines)
 
 
@@ -1132,7 +1166,7 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                     )
                     continue
                 try:
-                    cached = recent_reader_snapshot(url) if FETCH_MODE == "reader" else None
+                    cached = recent_reader_snapshot(url) if FETCH_MODE in ("reader", "browser") else None
                     items = await fetch(session, url)
                 except FetchError as exc:
                     reason = str(exc)
@@ -1143,7 +1177,7 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                         reason += f" Повтор через {pause // 60} мин."
                     report.errors.append(f"Поиск #{search_num(owner, sid)}: {reason}")
                     log.warning("Ошибка поиска #%s: %s", sid, reason)
-                    if FETCH_MODE == "reader":
+                    if FETCH_MODE in ("reader", "browser"):
                         snapshot = recent_reader_snapshot(url)
                         if snapshot:
                             report.notes.append(reader_snapshot_note(sid, owner, snapshot))
@@ -1222,7 +1256,7 @@ def next_cycle_delay(started: float) -> float:
     remaining = CHECK_INTERVAL - (now - started)
     if remaining <= 0:
         return CHECK_INTERVAL
-    if FETCH_MODE == "reader":
+    if FETCH_MODE in ("reader", "browser"):
         # A manual check can move a search's next refresh between regular cycles.
         # Wake at that deadline instead of delaying its next fetch for 10 minutes.
         for (url,) in db.execute("SELECT DISTINCT url FROM searches"):
@@ -1314,10 +1348,16 @@ async def main():
     await start_web()
     log.info("Источник объявлений: %s; интервал не меньше %s с", FETCH_MODE, CHECK_INTERVAL)
     seed_searches()
-    asyncio.create_task(keep_awake())
-    await wait_for_telegram()
-    asyncio.create_task(scheduler())
-    await dp.start_polling(bot)
+    tasks = [asyncio.create_task(keep_awake())]
+    try:
+        await wait_for_telegram()
+        tasks.append(asyncio.create_task(scheduler()))
+        await dp.start_polling(bot)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await browser_reader.close()
 
 
 if __name__ == "__main__":
