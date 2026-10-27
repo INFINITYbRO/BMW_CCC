@@ -18,6 +18,7 @@ Avito watcher — Telegram-бот, который следит за поиско
   /reserved N off             — показывать забронированные
   /stats N                     — медиана цен и рекомендуемый торг
   /check                       — проверить поиски и показать последний результат
+  /proxy                       — проверить прокси с сервера бота
 """
 import asyncio
 import html
@@ -46,6 +47,7 @@ from curl_cffi.requests.exceptions import RequestException
 from dotenv import load_dotenv
 from avito_parser import (clean_exclusions, is_reserved, normalize_text,
                           parse_details_html, parse_details_markdown)
+from proxy_diagnostics import connect_status, probe_target, proxy_conclusion
 
 load_dotenv()
 
@@ -196,6 +198,12 @@ connection_note = ""
 
 def network_error(exc: RequestException, via_proxy: bool) -> str:
     message = str(exc).lower()
+    status = connect_status(exc) if via_proxy else None
+    if status == 403:
+        return ("Прокси запретил HTTPS-туннель (CONNECT HTTP 403). "
+                "Причина запрета не указана. Команда /proxy проверит доступ с сервера бота.")
+    if status == 407:
+        return "Прокси требует авторизацию (CONNECT HTTP 407). Проверь логин и пароль PROXY в Render."
     if via_proxy and ("connect tunnel failed" in message or "proxy" in message
                       or int(exc.code) in (5, 7, 28, 97)):
         status = re.search(r"response\s+(\d{3})", message)
@@ -226,6 +234,11 @@ async def fetch_direct_page(session: AsyncSession, url: str, allow_missing: bool
             resp = await session.get(url, timeout=30, proxies={"all": ""})
         except RequestException:
             raise FetchError(reason + " Прямое соединение тоже недоступно.") from None
+    if via_proxy and resp.status_code != 407:
+        # A response from the HTTPS target proves that the tunnel now works.
+        # Do not keep showing an old CONNECT failure after proxy recovery.
+        connection_note = ""
+        proxy_retry_at = 0.0
     body = resp.text
     if allow_missing and resp.status_code in (404, 410):
         return body, resp.status_code
@@ -864,6 +877,64 @@ async def cmd_check(msg: Message):
     await msg.answer("Проверяю…")
     report = await run_check(chat_id=msg.chat.id)
     await msg.answer(report.text())
+
+
+proxy_probe_lock = asyncio.Lock()
+proxy_probe_reports: dict[int, tuple[float, str]] = {}
+
+
+async def build_proxy_report(chat_id: int) -> str:
+    row = db.execute("SELECT url FROM searches WHERE chat_id=? ORDER BY id LIMIT 1", (chat_id,)).fetchone()
+    target = normalize_url(row[0]) if row else "https://www.avito.ru/"
+    lines = ["Проверка PROXY с сервера бота. Все запросы идут только через настроенный прокси."]
+    async with AsyncSession(impersonate="chrome", trust_env=False) as session:
+        control = await probe_target(session, PROXY, "https://github.com/robots.txt")
+        avito = await probe_target(session, PROXY, target)
+        lines.extend((control.line("Контрольный HTTPS-сайт"), avito.line("Авито")))
+        if avito.http_status == 200 and row:
+            items = parse_items(avito.body)
+            lines.append(f"Карточек в выдаче: {len(items)}.")
+            if items:
+                item = items[0]
+                detail = await probe_target(session, PROXY, listing_url(item.url))
+                lines.append(detail.line("Полное объявление"))
+                if detail.http_status == 200:
+                    try:
+                        parsed = parse_details_html(detail.body, item.id)
+                        lines.append(f"Полное описание распознано: {len(parsed.description)} символов. "
+                                     f"Статус брони: {'есть' if parsed.reserved else 'нет'}.")
+                    except ValueError:
+                        lines.append("Полное описание и статус распознать не удалось; фильтры не подтверждены.")
+            else:
+                lines.append("Ответ HTTP 200 сам по себе не подтверждает чтение объявлений.")
+        elif not row:
+            lines.append("Чтобы проверить выдачу и описание, добавь свою ссылку поиска.")
+        lines.append(proxy_conclusion(control, avito))
+    return "\n".join(lines)
+
+
+@dp.message(Command("proxy"))
+async def cmd_proxy(msg: Message):
+    if not allowed(msg):
+        return
+    if not PROXY:
+        return await msg.answer("PROXY не задан в окружении сервера бота.")
+    previous = proxy_probe_reports.get(msg.chat.id)
+    if previous and time.monotonic() - previous[0] < 300:
+        remaining = max(1, 300 - int(time.monotonic() - previous[0]))
+        return await msg.answer(html.escape(f"Последняя проверка прокси; новый запрос через {remaining} с.\n{previous[1]}"))
+    if proxy_probe_lock.locked():
+        return await msg.answer("Проверка прокси уже идёт. Повтори /proxy чуть позже.")
+    async with proxy_probe_lock:
+        await msg.answer("Проверяю прокси с сервера бота… Это займёт до 45 секунд.")
+        try:
+            report = await build_proxy_report(msg.chat.id)
+        except Exception:
+            # Transport exceptions can contain credentials, so never interpolate
+            # or log them, even when an unexpected diagnostic failure occurs.
+            report = "Не удалось завершить диагностику прокси. Повтори позже."
+        proxy_probe_reports[msg.chat.id] = (time.monotonic(), report)
+        await msg.answer(html.escape(report))
 
 
 @dp.message()
