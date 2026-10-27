@@ -1,0 +1,39 @@
+name: Chromium parser and Docker runtime
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'requirements.txt'
+      - 'browser_fetcher.py'
+      - 'bot.py'
+      - 'avito_parser.py'
+      - 'tools/browser_smoke.py'
+      - 'tools/cloud_probe.py'
+      - '.github/workflows/browser-parser.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: browser-parser-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build the actual deployment image
+        run: docker build --tag avito-browser .
+      - name: Check JavaScript, cookies and complete descriptions in 512 MB
+        run: docker run --rm --memory=512m -i avito-browser python - < tools/browser_smoke.py
+      - name: Live Avito availability without credentials or CAPTCHA solving
+        id: live
+        continue-on-error: true
+        run: docker run --rm --memory=512m -i avito-browser python - --method browser --details < tools/cloud_probe.py
+      - name: Report unavailable live source separately from runtime tests
+        if: steps.live.outcome == 'failure'
+        run: echo "::warning::Live Avito access was not verified. See the JSON diagnostic above."

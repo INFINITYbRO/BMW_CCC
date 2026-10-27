@@ -8,6 +8,8 @@ on:
       - 'bot.py'
       - 'avito_parser.py'
       - 'proxy_diagnostics.py'
+      - 'browser_fetcher.py'
+      - 'requirements.txt'
       - 'tests/**'
   workflow_dispatch:
 permissions:

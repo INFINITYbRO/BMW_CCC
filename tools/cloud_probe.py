@@ -69,21 +69,26 @@ def curl_check():
         return {"method": "curl", "success": False, "error_type": type(exc).__name__}
 
 
-async def browser_check():
-    from playwright.async_api import async_playwright
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        try:
-            context = await browser.new_context(locale="ru-RU", viewport={"width":1280,"height":800})
-            page = await context.new_page()
-            response = await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            # Allow normal page JavaScript; do not attempt to solve any CAPTCHA.
-            await page.wait_for_timeout(5000)
-            return summarize("browser", response.status if response else None, await page.content())
-        except Exception as exc:
-            return {"method": "browser", "success": False, "error_type": type(exc).__name__}
-        finally:
-            await browser.close()
+async def browser_check(check_details=False):
+    os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    os.environ["DB_PATH"] = ":memory:"
+    os.environ["AVITO_FETCH_MODE"] = "browser"
+    os.environ["PROXY"] = ""  # never embed a user's proxy in a public workflow
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import bot
+    try:
+        items = await bot.fetch_browser(bot.normalize_url(URL))
+        result = {"method": "browser", "parsed_cards": len(items), "success": bool(items)}
+        if check_details and items:
+            detailed = await bot.read_item_details(None, items[0])
+            result.update(description_chars=len(detailed.description), reserved=detailed.reserved,
+                          active=detailed.active, detail_success=True)
+        return result
+    except bot.FetchError as exc:
+        return {"method": "browser", "success": False, "reason": str(exc)}
+    finally:
+        await bot.browser_reader.close()
 
 
 if __name__ == "__main__":
@@ -94,7 +99,7 @@ if __name__ == "__main__":
     if args.method == "reader":
         result = asyncio.run(reader_check(args.details))
     else:
-        result = curl_check() if args.method == "curl" else asyncio.run(browser_check())
+        result = curl_check() if args.method == "curl" else asyncio.run(browser_check(args.details))
     output = json.dumps(result, ensure_ascii=False)
     print(output, flush=True)
     if os.getenv("GITHUB_STEP_SUMMARY"):
