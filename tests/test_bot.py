@@ -47,6 +47,11 @@ class ParserTests(unittest.TestCase):
 
 
 class NetworkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_captcha_strings_inside_normal_page_scripts_are_not_a_block(self):
+        page = CARD + '<script>const error = "Доступ ограничен, проверка браузера";</script>'
+        session = SimpleNamespace(get=AsyncMock(return_value=response(page)))
+        self.assertEqual(len(await bot.fetch_direct(session, "https://www.avito.ru/sochi")), 1)
+
     async def asyncSetUp(self):
         self.config = patch.multiple(bot, PROXY="http://secret:password@proxy.invalid:8080",
                                      PROXY_FALLBACK=True, proxy_retry_at=0.0, connection_note="",
@@ -98,7 +103,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await bot.fetch(session, "https://www.avito.ru/sochi"), [])
 
 
-class MonitorTests(unittest.IsolatedAsyncioTestCase):
+class MonitorHarness(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.db = sqlite3.connect(":memory:")
         schema = "\n".join(bot.db.iterdump())
@@ -116,6 +121,9 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "connection_note", ""),
             patch.object(bot, "error_notices", {}),
             patch.object(bot, "reader_snapshots", {}),
+            patch.object(bot, "detail_snapshots", {}),
+            patch.object(bot, "fetch_direct", new=AsyncMock(side_effect=bot.FetchError("Прямой доступ недоступен"))),
+            patch.object(bot, "fetch_details", new=AsyncMock(side_effect=lambda session, listing: listing)),
             patch.object(bot, "FETCH_MODE", "direct"),
             patch.object(bot, "AsyncSession", return_value=self.session),
             patch.object(bot.asyncio, "sleep", new=AsyncMock()),
@@ -139,6 +147,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
     def pending(self):
         return self.db.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0]
 
+
+class MonitorTests(MonitorHarness):
     async def test_failed_delivery_survives_disappearing_listing_and_fetch_failure(self):
         self.search()
         self.telegram.send_message.side_effect = RuntimeError("Telegram temporarily unavailable")

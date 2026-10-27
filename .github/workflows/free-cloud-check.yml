@@ -6,6 +6,7 @@ on:
       - '.github/workflows/free-cloud-check.yml'
       - 'tools/cloud_probe.py'
       - 'bot.py'
+      - 'avito_parser.py'
       - 'tests/**'
   workflow_dispatch:
 permissions:
@@ -31,7 +32,7 @@ jobs:
       - name: Test fresh public search through free Reader
         id: reader
         continue-on-error: true
-        run: python tools/cloud_probe.py --method reader
+        run: python tools/cloud_probe.py --method reader --details
       - name: Test direct access to public Avito search
         if: steps.reader.outcome == 'failure'
         id: curl

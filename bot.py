@@ -13,6 +13,9 @@ Avito watcher — Telegram-бот, который следит за поиско
   /del N                       — удалить поиск
   /price N мин макс            — фильтр по цене (0 = без ограничения)
   /exclude N слово, слово      — не присылать объявления с этими словами
+  /exclude N -                — очистить слова-исключения
+  /reserved N on              — скрывать забронированные (по умолчанию)
+  /reserved N off             — показывать забронированные
   /stats N                     — медиана цен и рекомендуемый торг
   /check                       — проверить поиски и показать последний результат
 """
@@ -26,7 +29,7 @@ import re
 import sqlite3
 import statistics
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientSession, web
@@ -41,6 +44,8 @@ from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
 from dotenv import load_dotenv
+from avito_parser import (clean_exclusions, is_reserved, normalize_text,
+                          parse_details_html, parse_details_markdown)
 
 load_dotenv()
 
@@ -61,8 +66,9 @@ log = logging.getLogger("avito")
 
 # ---------------------------------------------------------------- база
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.executescript(
+def init_db(connection: sqlite3.Connection):
+    """Idempotent migration: preserve existing searches, items and delivery queue."""
+    connection.executescript(
     """
     CREATE TABLE IF NOT EXISTS searches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,13 +95,20 @@ db.executescript(
         PRIMARY KEY(search_id, item_id)
     );
     """
-)
-db.commit()
+    )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(searches)")}
+    if "skip_reserved" not in columns:
+        connection.execute("ALTER TABLE searches ADD COLUMN skip_reserved INTEGER NOT NULL DEFAULT 1")
+    connection.commit()
+
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+init_db(db)
 
 # SEARCHES в .env / на Render: по одному поиску на строку, формат «ссылка | название».
 # Нужны на Render: там диск очищается при каждом перезапуске, и /add-поиски пропадают.
 SEARCHES = [l.strip() for l in os.getenv("SEARCHES", "").replace(";;", "\n").splitlines() if l.strip()]
-DEFAULT_EXCLUDE = ", ".join(w.strip().lower() for w in os.getenv("DEFAULT_EXCLUDE", "").split(",") if w.strip())
+DEFAULT_EXCLUDE = clean_exclusions(os.getenv("DEFAULT_EXCLUDE", ""))
 
 
 # ---------------------------------------------------------------- парсинг Авито
@@ -110,6 +123,8 @@ class Item:
     date: str
     image: str | None
     description: str
+    reserved: bool = False
+    active: bool = True
 
 
 def normalize_url(url: str) -> str:
@@ -159,9 +174,11 @@ def parse_items(page: str) -> list[Item]:
         img = card.select_one("img")
         image = img.get("src") if img else None
         desc_meta = card.select_one('meta[itemprop="description"]')
-        description = desc_meta.get("content", "") if desc_meta else ""
+        description = desc_meta.get("content", "") if desc_meta else _text(
+            card.select_one('[data-marker="item-description"], [class*="iva-item-description"]'))
 
-        result.append(Item(item_id, title, price, url, place, date, image, description))
+        result.append(Item(item_id, title, price, url, place, date, image, description,
+                           is_reserved(card.get_text("\n", strip=True))))
     return result
 
 
@@ -190,7 +207,7 @@ def network_error(exc: RequestException, via_proxy: bool) -> str:
     return "Не удалось подключиться к Авито. Проверь сеть и настройку PROXY на Render."
 
 
-async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
+async def fetch_direct_page(session: AsyncSession, url: str, allow_missing: bool = False) -> tuple[str, int]:
     global proxy_retry_at, connection_note
     via_proxy = bool(PROXY) and time.time() >= proxy_retry_at
     options = {"proxy": PROXY} if via_proxy else {"proxies": {"all": ""}}
@@ -210,11 +227,22 @@ async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
         except RequestException:
             raise FetchError(reason + " Прямое соединение тоже недоступно.") from None
     body = resp.text
-    lowered = body.lower()
-    if (resp.status_code in (401, 403, 407, 429)
-            or any(marker in lowered for marker in (
+    if allow_missing and resp.status_code in (404, 410):
+        return body, resp.status_code
+    # Avito's normal HTML includes CAPTCHA/firewall strings inside JavaScript.
+    # Diagnose the rendered page text, not dormant scripts on a valid listing.
+    soup = BeautifulSoup(body, "lxml")
+    for node in soup.select("script, style, template, noscript"):
+        node.decompose()
+    visible = soup.get_text(" ", strip=True).lower()
+    has_content = bool(soup.select_one(
+        '[data-marker="item-view/item-description"], '
+        '[data-marker="item"] a[data-marker="item-title"], '
+        '[data-marker="item"] a[itemprop="url"]'))
+    if (resp.status_code in (401, 403, 407, 429, 439)
+            or (not has_content and any(marker in visible for marker in (
                 "доступ ограничен", "подтвердите, что вы не робот", "firewall",
-                "challenge-platform", "проверка браузера"))):
+                "challenge-platform", "проверка браузера")))):
         route = "через прокси" if via_proxy else "напрямую"
         raise Blocked(
             f"Авито ограничил доступ {route} (HTTP {resp.status_code}). "
@@ -222,6 +250,12 @@ async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
         )
     if resp.status_code >= 400:
         raise FetchError(f"Авито вернул HTTP {resp.status_code}. Проверь ссылку поиска.")
+    return body, resp.status_code
+
+
+async def fetch_direct(session: AsyncSession, url: str) -> list[Item]:
+    body, _ = await fetch_direct_page(session, url)
+    lowered = body.lower()
     items = parse_items(body)
     if not items and not any(text in lowered for text in (
             "ничего не найдено", "ничего не нашлось", "нет объявлений",
@@ -282,17 +316,26 @@ def parse_reader_items(markdown: str) -> list[Item]:
         r"\]\((https?://(?:www\.)?avito\.ru/[^\s)]*_\d{8,}(?:\?[^\s)]*)?)\)",
         markdown,
     ))
+    # Image, title and «ещё фото» can all link to the SAME item. Use the next
+    # different ID as a boundary, otherwise the price/description get lost.
+    groups = []
+    for match in matches:
+        parts = urlsplit(html.unescape(match[1]))
+        item_id = re.search(r"_(\d{8,})$", parts.path)[1]
+        if groups and groups[-1][0] == item_id:
+            groups[-1][2].append(match)
+        else:
+            groups.append((item_id, parts, [match]))
     result: list[Item] = []
     seen: set[str] = set()
-    for index, match in enumerate(matches):
-        parts = urlsplit(html.unescape(match[1]))
-        item_match = re.search(r"_(\d{8,})$", parts.path)
-        if not item_match or item_match[1] in seen:
+    for index, (item_id, parts, links) in enumerate(groups):
+        if item_id in seen:
             continue
+        match = links[0]
         start = markdown.rfind("\n", 0, match.start()) + 1
         label = markdown[start:match.start()]
-        end = (markdown.rfind("\n", match.end(), matches[index + 1].start()) + 1
-               if index + 1 < len(matches) else len(markdown))
+        end = (markdown.rfind("\n", 0, groups[index + 1][2][0].start()) + 1
+               if index + 1 < len(groups) else len(markdown))
         details = markdown[match.end():end]
         image_match = re.search(r"!\[([^\]]+)\]\((https?://[^\s)]+)\)", label)
         title = ""
@@ -314,14 +357,27 @@ def parse_reader_items(markdown: str) -> list[Item]:
             r"(?im)^\s*(сегодня[^\n]*|вчера[^\n]*|\d+\s+(?:минут[уы]?|час[аов]*|дн[яей]*)\s+назад)\s*$",
             details,
         )
-        seen.add(item_match[1])
+        seen.add(item_id)
         result.append(Item(
-            item_match[1], html.unescape(title), price,
+            item_id, html.unescape(title), price,
             urlunsplit(("https", "www.avito.ru", parts.path, "", "")),
             html.unescape(place), date_match[1].strip() if date_match else "",
-            image, re.sub(r"[\*_#]", "", details).strip()[:3000],
+            image, re.sub(r"[\*_#]", "", details).strip(),
+            is_reserved(details),
         ))
     return result
+
+
+reader_request_at = 0.0
+
+
+async def pace_reader():
+    """Share the unauthenticated Reader request budget across search and details."""
+    global reader_request_at
+    delay = reader_request_at - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    reader_request_at = time.monotonic() + 3.2
 
 
 async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
@@ -337,6 +393,7 @@ async def fetch_reader(session: AsyncSession, url: str) -> list[Item]:
             # A redirect or partial document may need ordinary browser rendering.
             headers.update({"X-Engine": "browser", "X-Respond-Timing": "resource-idle"})
         try:
+            await pace_reader()
             response = await session.get(
                 "https://r.jina.ai/" + target, headers=headers,
                 timeout=65, proxies={"all": ""}, allow_redirects=True, max_redirects=5,
@@ -410,7 +467,15 @@ async def fetch(session: AsyncSession, url: str) -> list[Item]:
         previous = reader_snapshots.get(target)
         started = time.monotonic()
         try:
-            items = await fetch_reader(session, target)
+            try:
+                items = await fetch_reader(session, target)
+            except FetchError as reader_error:
+                # A Reader IP can be blocked even when the deployment's own IP
+                # works. Try direct access, honouring the existing PROXY options.
+                try:
+                    items = await fetch_direct(session, target)
+                except FetchError as direct_error:
+                    raise FetchError(f"{reader_error} Резервный доступ: {direct_error}") from None
         except FetchError as exc:
             # Also throttle failed attempts. Repeated /check must not hammer a
             # blocked source or replace its last successful data with zero ads.
@@ -425,6 +490,116 @@ async def fetch(session: AsyncSession, url: str) -> list[Item]:
         )
         return items
     return await fetch_direct(session, url)
+
+
+@dataclass
+class DetailSnapshot:
+    started_at: float
+    item: Item | None = None
+    error: str = ""
+
+
+detail_snapshots: dict[str, DetailSnapshot] = {}
+
+
+def detail_refresh_interval() -> int:
+    return max(300, CHECK_INTERVAL) if FETCH_MODE == "reader" else max(30, min(60, CHECK_INTERVAL))
+
+
+def remember_details(target: str, snapshot: DetailSnapshot):
+    if target not in detail_snapshots and len(detail_snapshots) >= 500:
+        detail_snapshots.pop(next(iter(detail_snapshots)))
+    detail_snapshots[target] = snapshot
+
+
+def listing_url(url: str) -> str:
+    parts = urlsplit(normalize_url(url))  # validate the host, credentials and port
+    return urlunsplit(("https", "www.avito.ru", parts.path, "", ""))
+
+
+async def read_item_details(session: AsyncSession, item: Item) -> Item:
+    target = listing_url(item.url)
+    if FETCH_MODE == "direct":
+        page, status = await fetch_direct_page(session, target, allow_missing=True)
+        if status in (404, 410):
+            return replace(item, active=False)
+        try:
+            details = parse_details_html(page, item.id)
+        except ValueError:
+            raise FetchError("Не удалось прочитать полное описание и статус объявления.") from None
+    else:
+        await pace_reader()
+        try:
+            response = await session.get(
+                "https://r.jina.ai/" + target,
+                headers={"Accept": "application/json", "X-Cache-Tolerance": "0",
+                         "X-Timeout": "45", "X-Respond-With": "html"},
+                timeout=65, proxies={"all": ""}, allow_redirects=True, max_redirects=5,
+            )
+        except RequestException:
+            raise FetchError("Сервис чтения карточек временно недоступен.") from None
+        if response.status_code != 200:
+            raise FetchError(f"Сервис чтения карточек вернул HTTP {response.status_code}.")
+        try:
+            data = response.json()["data"]
+            if not isinstance(data, dict) or not isinstance(data.get("url"), str):
+                raise ValueError("Invalid reader data")
+            if listing_url(data["url"]) != target or type(data["httpStatus"]) is not int:
+                raise ValueError("Another listing or invalid target status")
+            status = data["httpStatus"]
+            page = data.get("html") or data.get("content", "")
+            if not isinstance(page, str):
+                raise ValueError("Invalid page")
+        except (KeyError, ValueError, TypeError):
+            raise FetchError("Некорректный ответ сервиса чтения карточек.") from None
+        if status in (404, 410):
+            return replace(item, active=False)
+        if status not in (200, 301, 302, 303, 307, 308):
+            raise FetchError(f"Авито не дал проверить карточку (HTTP {status}).")
+        try:
+            details = (parse_details_html(page, item.id) if "<" in page
+                       else parse_details_markdown(page))
+        except ValueError:
+            raise FetchError("Не удалось прочитать полное описание и статус объявления.") from None
+    return replace(item, description=details.description, reserved=details.reserved, active=details.active)
+
+
+async def fetch_details(session: AsyncSession, item: Item) -> Item:
+    """Cache successes AND failures so repeated /check cannot flood the source."""
+    target = listing_url(item.url)
+    interval = detail_refresh_interval()
+    snapshot = detail_snapshots.get(target)
+    if snapshot and time.monotonic() - snapshot.started_at < interval:
+        if snapshot.error:
+            raise FetchError(snapshot.error)
+        return replace(item, description=snapshot.item.description,
+                       reserved=snapshot.item.reserved, active=snapshot.item.active)
+    started = time.monotonic()
+    try:
+        try:
+            detailed = await read_item_details(session, item)
+        except FetchError as reader_error:
+            if FETCH_MODE != "reader":
+                raise
+            try:
+                page, status = await fetch_direct_page(session, target, allow_missing=True)
+                if status in (404, 410):
+                    detailed = replace(item, active=False)
+                else:
+                    try:
+                        details = parse_details_html(page, item.id)
+                    except ValueError:
+                        raise FetchError("Не удалось проверить описание и бронь через резервный доступ.") from None
+                    detailed = replace(item, description=details.description,
+                                       reserved=details.reserved, active=details.active)
+            except FetchError as direct_error:
+                raise FetchError(f"{reader_error} Резервный доступ: {direct_error}") from None
+    except FetchError as exc:
+        remember_details(target, DetailSnapshot(started, error=str(exc)))
+        raise
+    # Bound memory independently from the persistent queue / seen history.
+    remember_details(target, DetailSnapshot(started, detailed))
+    return detailed
 
 
 # ---------------------------------------------------------------- логика цен
@@ -550,7 +725,7 @@ async def add_search(msg: Message, text: str):
         f"Добавил поиск #{n} «{html.escape(title)}». Сейчас запомню текущие объявления, "
         f"присылать буду только новые.\nПереименовать: /name {n} новое название"
     )
-    asyncio.create_task(run_check())
+    asyncio.create_task(run_check(chat_id=msg.chat.id))
 
 
 @dp.message(Command("add"))
@@ -578,19 +753,20 @@ async def cmd_list(msg: Message):
     if not allowed(msg):
         return
     rows = db.execute(
-        "SELECT id, url, title, min_price, max_price, exclude FROM searches WHERE chat_id=? ORDER BY id",
+        "SELECT id, url, title, min_price, max_price, exclude, skip_reserved FROM searches WHERE chat_id=? ORDER BY id",
         (msg.chat.id,),
     ).fetchall()
     if not rows:
         return await msg.answer("Поисков нет. Пришли ссылку с Авито, чтобы добавить.")
     lines = []
-    for n, (sid, url, title, mn, mx, ex) in enumerate(rows, 1):
+    for n, (sid, url, title, mn, mx, ex, skip_reserved) in enumerate(rows, 1):
         name = html.escape(title or "поиск")
         flt = []
         if mn or mx:
             flt.append(f"цена {mn or 0}–{mx or '∞'}")
         if ex:
             flt.append(f"без: {html.escape(ex)}")
+        flt.append("без брони" if skip_reserved else "включая бронь")
         lines.append(f"#{n} <a href=\"{html.escape(url)}\">{name}</a> {'· ' + '; '.join(flt) if flt else ''}")
     await msg.answer("\n".join(lines), disable_web_page_preview=True)
 
@@ -620,6 +796,8 @@ async def cmd_price(msg: Message, command: CommandObject):
     row = owned_search(msg.chat.id, parts[0])
     if not row:
         return await msg.answer("Нет такого поиска.")
+    if int(parts[2]) and int(parts[1]) > int(parts[2]):
+        return await msg.answer("Минимальная цена не может быть больше максимальной.")
     db.execute("UPDATE searches SET min_price=?, max_price=? WHERE id=?", (int(parts[1]), int(parts[2]), row[0]))
     db.commit()
     await msg.answer("Готово.")
@@ -629,14 +807,34 @@ async def cmd_price(msg: Message, command: CommandObject):
 async def cmd_exclude(msg: Message, command: CommandObject):
     if not allowed(msg):
         return
-    sid, _, words = (command.args or "").partition(" ")
+    parts = (command.args or "").strip().split(maxsplit=1)
+    sid = parts[0] if parts else ""
+    words = parts[1] if len(parts) > 1 else ""
     row = owned_search(msg.chat.id, sid)
     if not row:
         return await msg.answer("Формат: /exclude 1 чехол, картридж, игра")
-    clean = ", ".join(w.strip().lower() for w in words.split(",") if w.strip())
+    clean = clean_exclusions(words)
     db.execute("UPDATE searches SET exclude=? WHERE id=?", (clean, row[0]))
     db.commit()
-    await msg.answer(f"Исключаю: {html.escape(clean) or 'ничего'}")
+    await msg.answer(f"Исключаю из названия и полного описания: {html.escape(clean) or 'ничего'}")
+
+
+@dp.message(Command("reserved"))
+async def cmd_reserved(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    parts = (command.args or "").strip().split()
+    switches = {"on": 1, "1": 1, "вкл": 1, "off": 0, "0": 0, "выкл": 0}
+    if len(parts) != 2 or parts[1].lower() not in switches:
+        return await msg.answer("Формат: /reserved 1 on — скрывать бронь, /reserved 1 off — показывать.")
+    row = owned_search(msg.chat.id, parts[0])
+    if not row:
+        return await msg.answer("Нет такого поиска. /list")
+    enabled = switches[parts[1].lower()]
+    db.execute("UPDATE searches SET skip_reserved=? WHERE id=?", (enabled, row[0]))
+    db.commit()
+    await msg.answer("Забронированные объявления скрыты." if enabled else
+                     "Забронированные объявления тоже будут приходить.")
 
 
 @dp.message(Command("stats"))
@@ -677,13 +875,17 @@ async def any_message(msg: Message):
     await msg.answer("Пришли ссылку с Авито (можно с названием) или /help")
 
 
-def passes_filters(item: Item, mn: int, mx: int, exclude: str) -> bool:
+def passes_filters(item: Item, mn: int, mx: int, exclude: str, skip_reserved: bool = True) -> bool:
+    if not item.active:
+        return False
+    if skip_reserved and (item.reserved or is_reserved(item.title + "\n" + item.description)):
+        return False
     if mn and item.price and item.price < mn:
         return False
     if mx and item.price > mx:
         return False
-    text = f"{item.title} {item.description}".lower()
-    return not any(w and w in text for w in exclude.split(", "))
+    text = normalize_text(f"{item.title} {item.description}")
+    return not any(w and w in text for w in clean_exclusions(exclude).split(", "))
 
 
 async def notify(chat_id: int, search_id: int, search_title: str | None, item: Item):
@@ -714,6 +916,7 @@ class CheckReport:
     found: int = 0
     sent: int = 0
     filtered: int = 0
+    deferred: int = 0
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     skipped: str = ""
@@ -725,6 +928,8 @@ class CheckReport:
             f"Проверено поисков: {self.checked}. Объявлений на страницах: {self.found}.",
             f"Отправлено: {self.sent}. Новых исключено фильтрами: {self.filtered}.",
         ]
+        if self.deferred:
+            lines.append(f"В очереди на проверку или отправку: {self.deferred}. Повторю автоматически.")
         if connection_note:
             lines.append(connection_note)
         lines.extend(self.errors)
@@ -736,31 +941,78 @@ class CheckReport:
 
 blocked_until = 0.0
 block_streak = 0
-error_notices: dict[int, tuple[str, float]] = {}
+error_notices: dict[int | tuple[int, str], tuple[str, float]] = {}
 
 
-async def report_error(chat_id: int, sid: int, reason: str):
-    previous, when = error_notices.get(sid, ("", 0.0))
+async def report_error(chat_id: int, sid: int, reason: str, scope: str = "search"):
+    key = sid if scope == "search" else (sid, scope)
+    previous, when = error_notices.get(key, ("", 0.0))
     if reason == previous and time.time() - when < 3600:
         return
     try:
         await bot.send_message(
             chat_id, html.escape(f"Поиск #{search_num(chat_id, sid)}: {reason}")
         )
-        error_notices[sid] = (reason, time.time())
+        error_notices[key] = (reason, time.time())
     except Exception:
         log.warning("Не удалось сообщить об ошибке поиска #%s", sid)
 
 
-async def deliver_pending(sid: int, chat_id: int, title: str | None,
-                          mn: int, mx: int, exclude: str, report: CheckReport) -> bool:
+@dataclass
+class DeliveryContext:
+    attempted: set[tuple[int, str]] = field(default_factory=set)
+    detail_requests: int = 0
+    detail_errors: set[int] = field(default_factory=set)
+
+
+def delivery_settings(sid: int, chat_id: int):
+    return db.execute(
+        "SELECT title, min_price, max_price, exclude, skip_reserved FROM searches WHERE id=? AND chat_id=?",
+        (sid, chat_id),
+    ).fetchone()
+
+
+async def deliver_pending(session: AsyncSession, sid: int, chat_id: int,
+                          report: CheckReport, context: DeliveryContext) -> bool:
     rows = db.execute(
         "SELECT item_id, payload FROM pending_notifications WHERE search_id=? "
         "ORDER BY created_at, rowid", (sid,),
     ).fetchall()
     for item_id, payload in rows:
+        if (sid, item_id) in context.attempted:
+            continue
+        settings = delivery_settings(sid, chat_id)
+        if settings is None:  # /del may run while a request is in progress
+            return True
+        title, mn, mx, exclude, skip_reserved = settings
         item = Item(**json.loads(payload))
-        if passes_filters(item, mn, mx, exclude):
+        if passes_filters(item, mn, mx, exclude, skip_reserved) and (exclude or skip_reserved):
+            snapshot = detail_snapshots.get(listing_url(item.url))
+            cached_detail = snapshot and time.monotonic() - snapshot.started_at < detail_refresh_interval()
+            if not cached_detail and context.detail_requests >= 10:
+                continue
+            context.attempted.add((sid, item_id))
+            if not cached_detail:
+                context.detail_requests += 1
+            try:
+                item = await fetch_details(session, item)
+            except FetchError as exc:
+                # Leave it in the queue even when it falls off the search page.
+                reason = f"Проверка описания и брони отложена: {exc} Объявления сохранены в очереди."
+                if sid not in context.detail_errors:
+                    context.detail_errors.add(sid)
+                    report.errors.append(f"Поиск #{search_num(chat_id, sid)}: {reason}")
+                    await report_error(chat_id, sid, reason, scope="details")
+                continue
+            settings = delivery_settings(sid, chat_id)
+            if settings is None:
+                return True
+            title, mn, mx, exclude, skip_reserved = settings
+            db.execute("UPDATE pending_notifications SET payload=? WHERE search_id=? AND item_id=?",
+                       (json.dumps(asdict(item), ensure_ascii=False), sid, item_id))
+            db.commit()
+        context.attempted.add((sid, item_id))
+        if passes_filters(item, mn, mx, exclude, skip_reserved):
             try:
                 await notify(chat_id, sid, title, item)
             except Exception:
@@ -789,8 +1041,9 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
         report.skipped = "Проверка уже идёт. Попробуй /check чуть позже."
         return report
     async with check_lock:
+        context = DeliveryContext()
         query = (
-            "SELECT id, chat_id, url, title, min_price, max_price, exclude, initialized "
+            "SELECT id, chat_id, url, title, min_price, max_price, exclude, initialized, skip_reserved "
             "FROM searches"
         )
         searches = db.execute(
@@ -798,9 +1051,9 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
             (chat_id,) if chat_id is not None else (),
         ).fetchall()
         async with AsyncSession(impersonate="chrome", trust_env=False) as session:
-            for sid, owner, url, title, mn, mx, exclude, initialized in searches:
+            for sid, owner, url, title, mn, mx, exclude, initialized, skip_reserved in searches:
                 # Retry Telegram independently of Avito availability and its backoff.
-                delivery_ok = await deliver_pending(sid, owner, title, mn, mx, exclude, report)
+                delivery_ok = await deliver_pending(session, sid, owner, report, context)
                 if time.time() < blocked_until:
                     report.errors.append(
                         f"Поиск #{search_num(owner, sid)}: пауза после ограничения Авито, "
@@ -837,6 +1090,13 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                 error_notices.pop(sid, None)
                 report.checked += 1
                 report.found += len(items)
+                current = db.execute(
+                    "SELECT title,min_price,max_price,exclude,initialized,skip_reserved FROM searches WHERE id=?",
+                    (sid,),
+                ).fetchone()
+                if current is None:
+                    continue
+                title, mn, mx, exclude, initialized, skip_reserved = current
                 if cached:
                     report.notes.append(reader_snapshot_note(sid, owner, cached))
                     log.info("Поиск #%s: последний ответ, %s объявлений; новый запрос не нужен",
@@ -852,7 +1112,7 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                             "VALUES(?,?,?,?)", (sid, item.id, item.price, now),
                         )
                         if cur.rowcount and initialized:
-                            if passes_filters(item, mn, mx, exclude):
+                            if passes_filters(item, mn, mx, exclude, skip_reserved):
                                 db.execute(
                                     "INSERT OR IGNORE INTO pending_notifications"
                                     "(search_id, item_id, payload, created_at) VALUES(?,?,?,?)",
@@ -876,8 +1136,13 @@ async def run_check(chat_id: int | None = None) -> CheckReport:
                 else:
                     # Avoid two attempts in one cycle if a previous pending send failed.
                     if delivery_ok:
-                        await deliver_pending(sid, owner, title, mn, mx, exclude, report)
+                        await deliver_pending(session, sid, owner, report, context)
                 await asyncio.sleep(random.uniform(4, 9))
+        report.deferred = db.execute(
+            "SELECT COUNT(*) FROM pending_notifications p JOIN searches s ON s.id=p.search_id" +
+            (" WHERE s.chat_id=?" if chat_id is not None else ""),
+            (chat_id,) if chat_id is not None else (),
+        ).fetchone()[0]
     return report
 
 
