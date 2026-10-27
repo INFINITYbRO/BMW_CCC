@@ -36,6 +36,7 @@ async def reader_check(check_details=False):
     os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
     os.environ["DB_PATH"] = ":memory:"
     os.environ["AVITO_FETCH_MODE"] = "reader"
+    os.environ["PROXY"] = ""  # public connectivity test, no configured credentials
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import bot
@@ -48,7 +49,7 @@ async def reader_check(check_details=False):
                       "success": bool(items), "fresh_page_required": True}
             if check_details and items:
                 try:
-                    detailed = await bot.read_item_details(session, items[0])
+                    detailed = await bot.fetch_details(session, items[0])
                     result.update(description_chars=len(detailed.description),
                                   reserved=detailed.reserved, active=detailed.active,
                                   detail_success=True)

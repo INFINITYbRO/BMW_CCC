@@ -15,6 +15,7 @@ from avito_parser import (clean_exclusions, is_reserved, parse_details_html,
 from test_bot import MonitorHarness, item
 
 REAL_FETCH_DETAILS = bot.fetch_details
+REAL_FETCH_DIRECT_PAGE = bot.fetch_direct_page
 
 DETAIL = '''<html><head>
 <link rel="canonical" href="https://www.avito.ru/sochi/sony_1234567890">
@@ -145,6 +146,7 @@ class FullDescriptionParserTests(unittest.TestCase):
 class DetailNetworkTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.patches = [patch.object(bot, "detail_snapshots", {}), patch.object(bot, "PROXY", None),
+                        patch.object(bot, "fetch_direct_page", new=AsyncMock(side_effect=bot.FetchError("Direct offline"))),
                         patch.object(bot.asyncio, "sleep", new=AsyncMock())]
         for p in self.patches:
             p.start()
@@ -178,13 +180,14 @@ class DetailNetworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_missing_listing_is_inactive(self):
         session = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(text="Gone", status_code=410)))
-        with patch.object(bot, "FETCH_MODE", "direct"):
+        with patch.object(bot, "FETCH_MODE", "direct"), patch.object(bot, "fetch_direct_page", REAL_FETCH_DIRECT_PAGE):
             result = await bot.fetch_details(session, listing())
         self.assertFalse(result.active)
 
     async def test_failed_check_is_cached_then_retried_after_expiry(self):
         with patch.object(bot, "FETCH_MODE", "reader"), patch.object(bot, "read_item_details",
-                new=AsyncMock(side_effect=[bot.FetchError("HTTP 429"), listing()])) as read:
+                new=AsyncMock(side_effect=[bot.FetchError("HTTP 429"), listing()])) as read, patch.object(
+                bot, "fetch_direct_page", new=AsyncMock(side_effect=bot.FetchError("Direct offline"))):
             for _ in range(2):
                 with self.assertRaises(bot.FetchError):
                     await bot.fetch_details(None, listing())
@@ -207,6 +210,15 @@ class DetailNetworkTests(unittest.IsolatedAsyncioTestCase):
                 bot, "fetch_direct_page", new=AsyncMock(return_value=(page, 200))) as direct:
             result = await bot.fetch_details(None, listing())
         self.assertEqual(result.description, "Полный текст через прокси")
+        direct.assert_awaited_once()
+
+    async def test_direct_fallback_works_without_any_new_proxy_setting(self):
+        page = DETAIL.format(status="", description="Полное описание напрямую")
+        with patch.object(bot, "FETCH_MODE", "reader"), patch.object(bot, "PROXY", None), patch.object(
+                bot, "read_item_details", new=AsyncMock(side_effect=bot.FetchError("HTTP 439"))), patch.object(
+                bot, "fetch_direct_page", new=AsyncMock(return_value=(page, 200))) as direct:
+            result = await bot.fetch_details(None, listing())
+        self.assertEqual(result.description, "Полное описание напрямую")
         direct.assert_awaited_once()
 
 

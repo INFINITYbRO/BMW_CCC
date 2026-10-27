@@ -227,13 +227,22 @@ async def fetch_direct_page(session: AsyncSession, url: str, allow_missing: bool
         except RequestException:
             raise FetchError(reason + " Прямое соединение тоже недоступно.") from None
     body = resp.text
-    lowered = body.lower()
     if allow_missing and resp.status_code in (404, 410):
         return body, resp.status_code
+    # Avito's normal HTML includes CAPTCHA/firewall strings inside JavaScript.
+    # Diagnose the rendered page text, not dormant scripts on a valid listing.
+    soup = BeautifulSoup(body, "lxml")
+    for node in soup.select("script, style, template, noscript"):
+        node.decompose()
+    visible = soup.get_text(" ", strip=True).lower()
+    has_content = bool(soup.select_one(
+        '[data-marker="item-view/item-description"], '
+        '[data-marker="item"] a[data-marker="item-title"], '
+        '[data-marker="item"] a[itemprop="url"]'))
     if (resp.status_code in (401, 403, 407, 429, 439)
-            or any(marker in lowered for marker in (
+            or (not has_content and any(marker in visible for marker in (
                 "доступ ограничен", "подтвердите, что вы не робот", "firewall",
-                "challenge-platform", "проверка браузера"))):
+                "challenge-platform", "проверка браузера")))):
         route = "через прокси" if via_proxy else "напрямую"
         raise Blocked(
             f"Авито ограничил доступ {route} (HTTP {resp.status_code}). "
@@ -461,10 +470,8 @@ async def fetch(session: AsyncSession, url: str) -> list[Item]:
             try:
                 items = await fetch_reader(session, target)
             except FetchError as reader_error:
-                # Honour the existing PROXY configuration as a fallback. No new
-                # key, paid service or environment variable is required.
-                if not PROXY:
-                    raise
+                # A Reader IP can be blocked even when the deployment's own IP
+                # works. Try direct access, honouring the existing PROXY options.
                 try:
                     items = await fetch_direct(session, target)
                 except FetchError as direct_error:
@@ -571,19 +578,22 @@ async def fetch_details(session: AsyncSession, item: Item) -> Item:
     try:
         try:
             detailed = await read_item_details(session, item)
-        except FetchError:
-            if FETCH_MODE != "reader" or not PROXY:
+        except FetchError as reader_error:
+            if FETCH_MODE != "reader":
                 raise
-            page, status = await fetch_direct_page(session, target, allow_missing=True)
-            if status in (404, 410):
-                detailed = replace(item, active=False)
-            else:
-                try:
-                    details = parse_details_html(page, item.id)
-                except ValueError:
-                    raise FetchError("Не удалось проверить описание и бронь через резервный доступ.") from None
-                detailed = replace(item, description=details.description,
-                                   reserved=details.reserved, active=details.active)
+            try:
+                page, status = await fetch_direct_page(session, target, allow_missing=True)
+                if status in (404, 410):
+                    detailed = replace(item, active=False)
+                else:
+                    try:
+                        details = parse_details_html(page, item.id)
+                    except ValueError:
+                        raise FetchError("Не удалось проверить описание и бронь через резервный доступ.") from None
+                    detailed = replace(item, description=details.description,
+                                       reserved=details.reserved, active=details.active)
+            except FetchError as direct_error:
+                raise FetchError(f"{reader_error} Резервный доступ: {direct_error}") from None
     except FetchError as exc:
         remember_details(target, DetailSnapshot(started, error=str(exc)))
         raise
