@@ -32,9 +32,10 @@ def summarize(method, status, page):
     return result
 
 
-async def reader_check():
+async def reader_check(check_details=False):
     os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
     os.environ["DB_PATH"] = ":memory:"
+    os.environ["AVITO_FETCH_MODE"] = "reader"
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import bot
@@ -42,9 +43,18 @@ async def reader_check():
     async with AsyncSession(impersonate="chrome", trust_env=False) as session:
         try:
             items = await bot.fetch_reader(session, bot.normalize_url(URL))
-            return {"method": "reader", "parsed_cards": len(items),
-                    "priced_cards": sum(bool(item.price) for item in items),
-                    "success": bool(items), "fresh_page_required": True}
+            result = {"method": "reader", "parsed_cards": len(items),
+                      "priced_cards": sum(bool(item.price) for item in items),
+                      "success": bool(items), "fresh_page_required": True}
+            if check_details and items:
+                try:
+                    detailed = await bot.read_item_details(session, items[0])
+                    result.update(description_chars=len(detailed.description),
+                                  reserved=detailed.reserved, active=detailed.active,
+                                  detail_success=True)
+                except bot.FetchError as exc:
+                    result.update(success=False, detail_success=False, reason=str(exc))
+            return result
         except bot.FetchError as exc:
             return {"method": "reader", "success": False, "reason": str(exc)}
 
@@ -78,9 +88,10 @@ async def browser_check():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=("curl", "browser", "reader"), required=True)
+    parser.add_argument("--details", action="store_true", help="Also verify one complete listing through Reader")
     args = parser.parse_args()
     if args.method == "reader":
-        result = asyncio.run(reader_check())
+        result = asyncio.run(reader_check(args.details))
     else:
         result = curl_check() if args.method == "curl" else asyncio.run(browser_check())
     output = json.dumps(result, ensure_ascii=False)

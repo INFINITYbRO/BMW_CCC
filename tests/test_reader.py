@@ -42,6 +42,12 @@ def response(status=200, target_status=200, content=MARKDOWN, url=URL):
 
 
 class ReaderParserTests(unittest.TestCase):
+    def test_repeated_image_and_title_links_do_not_drop_price_or_description(self):
+        markdown = MARKDOWN.replace("**9 500₽**", "[Sony PS Vita](https://www.avito.ru/sochi/games/sony_vita_1234567890)\n\n**9 500₽**")
+        items = bot.parse_reader_items(markdown)
+        self.assertEqual([i.price for i in items], [9500, 8000, 7500])
+        self.assertIn("Чехол в комплекте", items[0].description)
+
     def test_three_cards_have_correct_boundaries_and_prices(self):
         items = bot.parse_reader_items(MARKDOWN)
         self.assertEqual(len(items), 3)
